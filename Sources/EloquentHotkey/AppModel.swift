@@ -1,13 +1,17 @@
 @preconcurrency import AppKit
+import Carbon
 import Foundation
+import OSLog
 
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var availableMicrophones: [MicrophoneOption] = []
     @Published private(set) var isListening = false
+    @Published private(set) var isCleaningUp = false
     @Published private(set) var lastText: String
     @Published private(set) var statusMessage: String = "Ready"
     @Published private(set) var hotkeyRegistrationSucceeded = true
+    @Published private(set) var cleanupEngineStatus = TranscriptCleaner.currentStatus()
 
     @Published var selectedMicrophoneID: String {
         didSet {
@@ -18,6 +22,10 @@ final class AppModel: ObservableObject {
     @Published var autoPasteEnabled: Bool {
         didSet {
             defaults.set(autoPasteEnabled, forKey: Defaults.autoPasteEnabled)
+
+            if autoPasteEnabled && !ensurePostEventAccess(promptIfNeeded: true) {
+                statusMessage = "Allow EloquentHotkey to control your computer to enable auto-paste."
+            }
         }
     }
 
@@ -42,7 +50,7 @@ final class AppModel: ObservableObject {
     @Published var hotkey: Shortcut {
         didSet {
             defaults.set(Int(hotkey.keyCode), forKey: Defaults.hotkeyKeyCode)
-            defaults.set(Int(hotkey.modifiers), forKey: Defaults.hotkeyModifiers)
+            defaults.set(Int(hotkey.modifiers.rawValue), forKey: Defaults.hotkeyModifiers)
             registerHotkey()
         }
     }
@@ -56,11 +64,14 @@ final class AppModel: ObservableObject {
         static let hotkeyKeyCode = "hotkeyKeyCode"
         static let hotkeyModifiers = "hotkeyModifiers"
         static let lastText = "lastText"
+        static let hasRequestedListenEventPrompt = "hasRequestedListenEventPrompt"
+        static let hasRequestedPostEventPrompt = "hasRequestedPostEventPrompt"
     }
 
     private let defaults = UserDefaults.standard
-    private let textPolisher = TextPolisher()
+    private let transcriptCleaner = TranscriptCleaner()
     private let hotkeyManager = GlobalHotkeyManager()
+    private let logger = Logger(subsystem: "dev.codex.EloquentHotkey", category: "AppModel")
 
     private var activeDictation: DictationController?
     private var dictationTask: Task<Void, Never>?
@@ -78,9 +89,9 @@ final class AppModel: ObservableObject {
         let savedKeyCode = defaults.object(forKey: Defaults.hotkeyKeyCode) as? Int
         let savedModifiers = defaults.object(forKey: Defaults.hotkeyModifiers) as? Int
         if let savedKeyCode, let savedModifiers {
-            self.hotkey = Shortcut(
-                keyCode: UInt32(savedKeyCode),
-                modifiers: UInt32(savedModifiers)
+            self.hotkey = Self.loadShortcut(
+                keyCode: savedKeyCode,
+                modifiers: savedModifiers
             )
         } else {
             self.hotkey = .defaultValue
@@ -89,15 +100,22 @@ final class AppModel: ObservableObject {
         refreshMicrophones()
         lastExternalApplication = currentTargetApplication()
 
-        hotkeyManager.onKeyPress = { [weak self] in
+        hotkeyManager.onPress = { [weak self] in
             Task { @MainActor in
-                self?.toggleDictation()
+                self?.startDictation(trigger: .holdToTalk)
+            }
+        }
+
+        hotkeyManager.onRelease = { [weak self] in
+            Task { @MainActor in
+                self?.stopDictation()
             }
         }
 
         observeActiveApplications()
 
         DispatchQueue.main.async { [weak self] in
+            self?.refreshCleanupEngineStatus()
             self?.registerHotkey()
         }
     }
@@ -113,21 +131,41 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func refreshCleanupEngineStatus() {
+        cleanupEngineStatus = TranscriptCleaner.currentStatus()
+    }
+
     func updateHotkey(_ newHotkey: Shortcut) {
+        if !PermissionManager.hasListenEventAccess() {
+            _ = ensureListenEventAccess(promptIfNeeded: true)
+        }
+
         hotkey = newHotkey
-        statusMessage = "Shortcut updated to \(newHotkey.displayString)."
+        if hotkeyRegistrationSucceeded {
+            statusMessage = "Hold \(newHotkey.displayString) to dictate."
+        }
     }
 
     func resetHotkey() {
+        if !PermissionManager.hasListenEventAccess() {
+            _ = ensureListenEventAccess(promptIfNeeded: true)
+        }
+
         hotkey = .defaultValue
-        statusMessage = "Shortcut reset to \(hotkey.displayString)."
+        if hotkeyRegistrationSucceeded {
+            statusMessage = "Hold \(hotkey.displayString) to dictate."
+        }
     }
 
     func toggleDictation() {
+        guard !isCleaningUp else {
+            return
+        }
+
         if isListening {
             stopDictation()
         } else {
-            startDictation()
+            startDictation(trigger: .manual)
         }
     }
 
@@ -140,12 +178,20 @@ final class AppModel: ObservableObject {
         statusMessage = "Last result copied to the clipboard."
     }
 
+    func setHotkeyMonitoringEnabled(_ enabled: Bool) {
+        hotkeyManager.isEnabled = enabled
+    }
+
     func pasteLastResult() {
         guard !lastText.isEmpty else {
             return
         }
 
         ClipboardManager.copy(lastText)
+        guard ensurePostEventAccess(promptIfNeeded: true) else {
+            statusMessage = "Could not paste automatically. Allow EloquentHotkey to control your computer, then try again. The text is still on your clipboard."
+            return
+        }
 
         Task {
             let pasted = await AutoPasteController.paste(
@@ -160,20 +206,41 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startDictation() {
-        guard !isListening else {
+    private enum DictationTrigger {
+        case holdToTalk
+        case manual
+
+        var autoStopOnSilence: Bool {
+            self == .manual
+        }
+
+        var logName: String {
+            switch self {
+            case .holdToTalk:
+                "hold-to-talk"
+            case .manual:
+                "manual"
+            }
+        }
+    }
+
+    private func startDictation(trigger: DictationTrigger) {
+        guard !isListening, !isCleaningUp else {
             return
         }
 
         statusMessage = "Listening with \(selectedMicrophoneName)…"
         isListening = true
-        NSSound.beep()
+        isCleaningUp = false
+        logger.debug("Starting dictation via \(trigger.logName, privacy: .public)")
+        SoundEffect.playStartRecording()
 
         let targetApplication = currentTargetApplication()
         let config = DictationConfiguration(
             microphoneID: selectedMicrophoneID == AudioDeviceManager.systemDefaultID ? nil : selectedMicrophoneID,
             silenceTimeout: silenceTimeout,
-            maxDuration: maxDuration
+            maxDuration: maxDuration,
+            autoStopOnSilence: trigger.autoStopOnSilence
         )
         let dictation = DictationController(configuration: config)
 
@@ -183,7 +250,17 @@ final class AppModel: ObservableObject {
             do {
                 try await PermissionManager.requestMicrophoneAndSpeechAccess()
                 let transcript = try await dictation.captureAndTranscribe()
-                let polished = cleanupEnabled ? textPolisher.polish(transcript) : transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                let polished: String
+
+                if cleanupEnabled {
+                    await MainActor.run {
+                        beginCleanupPhase()
+                    }
+                    polished = await transcriptCleaner.clean(transcript)
+                } else {
+                    polished = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+
                 await MainActor.run {
                     completeDictation(with: polished, targetApplication: targetApplication)
                 }
@@ -201,7 +278,15 @@ final class AppModel: ObservableObject {
         }
 
         statusMessage = "Finishing dictation…"
+        logger.debug("Stop requested from UI or key release")
         activeDictation?.requestStop()
+    }
+
+    private func beginCleanupPhase() {
+        isListening = false
+        isCleaningUp = true
+        activeDictation = nil
+        statusMessage = "Cleaning up transcript…"
     }
 
     private func completeDictation(with text: String, targetApplication: NSRunningApplication?) {
@@ -210,7 +295,8 @@ final class AppModel: ObservableObject {
         activeDictation = nil
         dictationTask = nil
         isListening = false
-        NSSound.beep()
+        isCleaningUp = false
+        SoundEffect.playFinishRecording()
 
         guard !cleaned.isEmpty else {
             statusMessage = "No text was captured."
@@ -222,6 +308,11 @@ final class AppModel: ObservableObject {
         ClipboardManager.copy(cleaned)
 
         if autoPasteEnabled {
+            guard ensurePostEventAccess(promptIfNeeded: true) else {
+                statusMessage = "Copied last result. Allow EloquentHotkey to control your computer to enable auto-paste."
+                return
+            }
+
             statusMessage = "Copied last result. Pasting…"
 
             Task {
@@ -244,7 +335,8 @@ final class AppModel: ObservableObject {
         activeDictation = nil
         dictationTask = nil
         isListening = false
-        NSSound.beep()
+        isCleaningUp = false
+        SoundEffect.playFinishRecording()
         statusMessage = error.localizedDescription
     }
 
@@ -282,7 +374,76 @@ final class AppModel: ObservableObject {
     private func registerHotkey() {
         hotkeyRegistrationSucceeded = hotkeyManager.register(shortcut: hotkey)
         if !hotkeyRegistrationSucceeded {
-            statusMessage = "The shortcut \(hotkey.displayString) is unavailable. Pick a different one."
+            statusMessage = PermissionManager.hasListenEventAccess()
+                ? "Could not activate \(hotkey.displayString) as the global hold-to-talk shortcut."
+                : "Allow EloquentHotkey to monitor your keyboard to use the global hold-to-talk shortcut."
         }
+    }
+
+    @discardableResult
+    private func ensureListenEventAccess(promptIfNeeded: Bool) -> Bool {
+        if PermissionManager.hasListenEventAccess() {
+            return true
+        }
+
+        guard promptIfNeeded else {
+            return false
+        }
+
+        let hasRequestedPrompt = defaults.bool(forKey: Defaults.hasRequestedListenEventPrompt)
+        if !hasRequestedPrompt {
+            defaults.set(true, forKey: Defaults.hasRequestedListenEventPrompt)
+            _ = PermissionManager.hasListenEventAccess(prompt: true)
+        }
+
+        return PermissionManager.hasListenEventAccess()
+    }
+
+    @discardableResult
+    private func ensurePostEventAccess(promptIfNeeded: Bool) -> Bool {
+        if PermissionManager.hasPostEventAccess() {
+            return true
+        }
+
+        guard promptIfNeeded else {
+            return false
+        }
+
+        let hasRequestedPrompt = defaults.bool(forKey: Defaults.hasRequestedPostEventPrompt)
+        if !hasRequestedPrompt {
+            defaults.set(true, forKey: Defaults.hasRequestedPostEventPrompt)
+            _ = PermissionManager.hasPostEventAccess(prompt: true)
+        }
+
+        return PermissionManager.hasPostEventAccess()
+    }
+
+    private static func loadShortcut(keyCode: Int, modifiers: Int) -> Shortcut {
+        let appKitThreshold = 1 << 16
+        if modifiers < appKitThreshold {
+            var converted: NSEvent.ModifierFlags = []
+            if modifiers & Int(cmdKey) != 0 {
+                converted.insert(.command)
+            }
+            if modifiers & Int(controlKey) != 0 {
+                converted.insert(.control)
+            }
+            if modifiers & Int(optionKey) != 0 {
+                converted.insert(.option)
+            }
+            if modifiers & Int(shiftKey) != 0 {
+                converted.insert(.shift)
+            }
+
+            return Shortcut(
+                keyCode: UInt16(keyCode),
+                modifiers: converted
+            )
+        }
+
+        return Shortcut(
+            keyCode: UInt16(keyCode),
+            modifiers: NSEvent.ModifierFlags(rawValue: UInt(modifiers))
+        )
     }
 }

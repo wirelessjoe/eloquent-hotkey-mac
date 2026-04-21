@@ -23,5 +23,9 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
             ]
         ),
+        .testTarget(
+            name: "EloquentHotkeyTests",
+            dependencies: ["EloquentHotkey"]
+        ),
     ]
 )

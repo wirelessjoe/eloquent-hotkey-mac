@@ -1,26 +1,76 @@
+import ApplicationServices
 import AVFoundation
 import Foundation
 import Speech
 
 enum PermissionManager {
     static func requestMicrophoneAndSpeechAccess() async throws {
-        let microphoneGranted = await withCheckedContinuation { continuation in
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                continuation.resume(returning: granted)
-            }
+        try await requestMicrophoneAccessIfNeeded()
+        try await requestSpeechAccessIfNeeded()
+    }
+
+    static func hasListenEventAccess(prompt: Bool = false) -> Bool {
+        if CGPreflightListenEventAccess() {
+            return true
         }
 
-        guard microphoneGranted else {
+        guard prompt else {
+            return false
+        }
+
+        return CGRequestListenEventAccess()
+    }
+
+    static func hasPostEventAccess(prompt: Bool = false) -> Bool {
+        if CGPreflightPostEventAccess() {
+            return true
+        }
+
+        guard prompt else {
+            return false
+        }
+
+        return CGRequestPostEventAccess()
+    }
+
+    private static func requestMicrophoneAccessIfNeeded() async throws {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .notDetermined:
+            let granted = await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+
+            guard granted else {
+                throw AppError.microphoneDenied
+            }
+        case .denied, .restricted:
+            throw AppError.microphoneDenied
+        @unknown default:
             throw AppError.microphoneDenied
         }
+    }
 
-        let speechStatus = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
+    private static func requestSpeechAccessIfNeeded() async throws {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized:
+            return
+        case .notDetermined:
+            let status = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { status in
+                    continuation.resume(returning: status)
+                }
             }
-        }
 
-        guard speechStatus == .authorized else {
+            guard status == .authorized else {
+                throw AppError.speechDenied
+            }
+        case .denied, .restricted:
+            throw AppError.speechDenied
+        @unknown default:
             throw AppError.speechDenied
         }
     }

@@ -8,6 +8,8 @@
   <string>EloquentHotkey</string>
   <key>CFBundleExecutable</key>
   <string>EloquentHotkey</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>dev.codex.EloquentHotkey</string>
   <key>CFBundleInfoDictionaryVersion</key>

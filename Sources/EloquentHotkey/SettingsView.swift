@@ -21,7 +21,8 @@ struct SettingsView: View {
             Section("Shortcut") {
                 ShortcutRecorderRow(
                     shortcut: model.hotkey,
-                    onChange: { model.updateHotkey($0) }
+                    onChange: { model.updateHotkey($0) },
+                    onRecordingChange: { model.setHotkeyMonitoringEnabled(!$0) }
                 )
 
                 HStack {
@@ -36,7 +37,7 @@ struct SettingsView: View {
                 }
 
                 if !model.hotkeyRegistrationSucceeded {
-                    Text("That shortcut could not be registered. Try a different combination.")
+                    Text("That shortcut is inactive. Make sure Accessibility access is enabled, then try again.")
                         .font(.caption)
                         .foregroundStyle(.red)
                 }
@@ -46,13 +47,34 @@ struct SettingsView: View {
                 Toggle("Auto-paste after dictation", isOn: $model.autoPasteEnabled)
                 Toggle("Clean up filler words and spacing", isOn: $model.cleanupEnabled)
 
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Cleanup engine")
+                        Spacer()
+                        Text(model.cleanupEngineStatus.headline)
+                            .foregroundStyle(model.cleanupEngineStatus.isAppleIntelligenceActive ? .green : .secondary)
+                    }
+
+                    Text(model.cleanupEngineStatus.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Refresh Model Status") {
+                        model.refreshCleanupEngineStatus()
+                    }
+                    .font(.caption)
+                }
+
                 HStack {
-                    Text("Silence timeout")
+                    Text("Silence timeout (manual start)")
                     Spacer()
                     Text(String(format: "%.1f s", model.silenceTimeout))
                         .foregroundStyle(.secondary)
                 }
                 Slider(value: $model.silenceTimeout, in: 0.6...3.0, step: 0.1)
+                Text("Press-and-hold dictation stops when you release the shortcut. This timeout only applies when you start dictation from the menu.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 HStack {
                     Text("Maximum recording length")
@@ -81,12 +103,16 @@ struct SettingsView: View {
                 }
             }
         }
+        .onAppear {
+            model.refreshCleanupEngineStatus()
+        }
     }
 }
 
 struct ShortcutRecorderRow: View {
     let shortcut: Shortcut
     let onChange: (Shortcut) -> Void
+    let onRecordingChange: (Bool) -> Void
 
     @StateObject private var recorder = ShortcutRecorderState()
 
@@ -96,16 +122,16 @@ struct ShortcutRecorderRow: View {
             Spacer()
             VStack(alignment: .trailing, spacing: 6) {
                 Button(recorder.isRecording ? "Press a shortcut…" : shortcut.displayString) {
-                    recorder.beginRecording(onChange: onChange)
+                    recorder.beginRecording(onChange: onChange, onRecordingChange: onRecordingChange)
                 }
 
-                Text(recorder.isRecording ? "Press a new shortcut or Esc to cancel." : "Choose a keyboard shortcut for starting or stopping dictation.")
+                Text(recorder.isRecording ? "Press a new shortcut, or press Fn by itself. Press Esc to cancel." : "Choose a press-and-hold shortcut for dictation.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .onDisappear {
-            recorder.stopRecording()
+            recorder.stopRecording(onRecordingChange: onRecordingChange)
         }
     }
 }
@@ -115,36 +141,45 @@ final class ShortcutRecorderState: ObservableObject {
 
     private var monitor: Any?
 
-    func beginRecording(onChange: @escaping (Shortcut) -> Void) {
-        stopRecording()
+    func beginRecording(
+        onChange: @escaping (Shortcut) -> Void,
+        onRecordingChange: @escaping (Bool) -> Void
+    ) {
+        stopRecording(onRecordingChange: onRecordingChange)
         isRecording = true
+        onRecordingChange(true)
 
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self, self.isRecording else {
                 return event
             }
 
-            if event.keyCode == UInt16(kVK_Escape) {
-                self.stopRecording()
+            if event.type == .keyDown, event.keyCode == UInt16(kVK_Escape) {
+                self.stopRecording(onRecordingChange: onRecordingChange)
                 return nil
             }
 
             guard let shortcut = Shortcut.from(event: event) else {
-                return nil
+                return event.type == .flagsChanged ? event : nil
             }
 
-            self.stopRecording()
+            self.stopRecording(onRecordingChange: onRecordingChange)
             onChange(shortcut)
             return nil
         }
     }
 
-    func stopRecording() {
+    func stopRecording(onRecordingChange: ((Bool) -> Void)? = nil) {
+        let wasRecording = isRecording
         isRecording = false
 
         if let monitor {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
+        }
+
+        if wasRecording {
+            onRecordingChange?(false)
         }
     }
 }
