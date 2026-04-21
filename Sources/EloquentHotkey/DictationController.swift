@@ -29,6 +29,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
     private var startedAt = Date()
     private var lastTranscriptChangeAt = Date()
     private var latestTranscript = ""
+    private var transcriptAccumulator = TranscriptAccumulator()
     private var sawSpeech = false
     private var isFinishing = false
     private var stopRequestedAt: Date?
@@ -107,6 +108,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             self.startedAt = Date()
             self.lastTranscriptChangeAt = Date()
             self.latestTranscript = ""
+            self.transcriptAccumulator = TranscriptAccumulator()
             self.sawSpeech = false
             self.isFinishing = false
             self.audioCaptureEnded = false
@@ -149,8 +151,17 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
 
     private func handleRecognition(result: SFSpeechRecognitionResult?, error: Error?) {
         if let result {
-            let transcript = result.bestTranscription.formattedString
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let update = transcriptAccumulator.ingest(
+                formattedTranscript: result.bestTranscription.formattedString,
+                segments: result.bestTranscription.segments.map {
+                    TranscriptAccumulator.Segment(
+                        timestamp: $0.timestamp,
+                        duration: $0.duration,
+                        text: $0.substring
+                    )
+                }
+            )
+            let transcript = update.transcript
 
             if transcript != latestTranscript {
                 latestTranscript = transcript
@@ -158,6 +169,10 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
                     sawSpeech = true
                     lastTranscriptChangeAt = Date()
                 }
+            }
+
+            if update.recognizerTranscriptShrank {
+                Self.logger.notice("Recognizer returned a shorter transcript snapshot; preserving the longer accumulated transcript")
             }
 
             if result.isFinal {

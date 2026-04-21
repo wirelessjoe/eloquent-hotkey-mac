@@ -1,5 +1,9 @@
 # EloquentHotkey
 
+<p align="center">
+  <img src="Resources/AppIcon-1024.png" alt="EloquentHotkey pasta icon" width="140">
+</p>
+
 `EloquentHotkey` is a fast macOS menu bar dictation app built for one job: hold a shortcut, talk, release, and get cleaned-up text back in the app you were already using.
 
 It is inspired by the workflow of Google AI Edge Eloquent, but it is an independent macOS app built with Apple's speech stack, Apple-friendly on-device cleanup when available, and a lightweight local fallback when it is not.

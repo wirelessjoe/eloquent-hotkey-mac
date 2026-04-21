@@ -86,7 +86,7 @@ struct SettingsView: View {
             }
 
             Section("Recovery") {
-                Text("The app always keeps the last result on your clipboard, and you can also use the menu bar actions to copy or paste it again if the original field misses focus.")
+                Text("The app saves the last result locally so you can paste it again without replacing your clipboard. Use Copy Last Result only when you intentionally want the transcript on your clipboard.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
