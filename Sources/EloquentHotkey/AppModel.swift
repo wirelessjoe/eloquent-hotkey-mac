@@ -187,21 +187,21 @@ final class AppModel: ObservableObject {
             return
         }
 
-        ClipboardManager.copy(lastText)
         guard ensurePostEventAccess(promptIfNeeded: true) else {
-            statusMessage = "Could not paste automatically. Allow EloquentHotkey to control your computer, then try again. The text is still on your clipboard."
+            statusMessage = "Could not paste automatically. Allow EloquentHotkey to control your computer, then try again. The last result is still saved in the app."
             return
         }
 
         Task {
             let pasted = await AutoPasteController.paste(
+                lastText,
                 into: currentTargetApplication()
             )
 
             await MainActor.run {
                 statusMessage = pasted
                     ? "Last result pasted."
-                    : "Could not paste automatically. The text is still on your clipboard."
+                    : "Could not paste automatically. Use Copy Last Result if you want it on your clipboard."
             }
         }
     }
@@ -305,29 +305,29 @@ final class AppModel: ObservableObject {
 
         lastText = cleaned
         defaults.set(cleaned, forKey: Defaults.lastText)
-        ClipboardManager.copy(cleaned)
 
         if autoPasteEnabled {
             guard ensurePostEventAccess(promptIfNeeded: true) else {
-                statusMessage = "Copied last result. Allow EloquentHotkey to control your computer to enable auto-paste."
+                statusMessage = "Saved last result. Allow EloquentHotkey to control your computer to enable auto-paste."
                 return
             }
 
-            statusMessage = "Copied last result. Pasting…"
+            statusMessage = "Saved last result. Pasting…"
 
             Task {
                 let pasted = await AutoPasteController.paste(
+                    cleaned,
                     into: targetApplication
                 )
 
                 await MainActor.run {
                     statusMessage = pasted
                         ? "Dictation pasted."
-                        : "Copied last result. Use Paste Last Result if the field missed focus."
+                        : "Saved last result. Use Paste Last Result again or Copy Last Result if the field missed focus."
                 }
             }
         } else {
-            statusMessage = "Copied last result to the clipboard."
+            statusMessage = "Saved last result. Use Copy Last Result if you want it on your clipboard."
         }
     }
 
