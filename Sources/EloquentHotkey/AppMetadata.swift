@@ -1,7 +1,7 @@
 import Foundation
 
 enum AppMetadata {
-    private static let fallbackVersion = "0.1.1"
+    private static let fallbackVersion = "0.1.2"
     private static let fallbackBuild = "2"
 
     static let authorHandle = "@wirelessjoe"
