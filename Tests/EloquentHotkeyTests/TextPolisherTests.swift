@@ -38,4 +38,18 @@ final class TextPolisherTests: XCTestCase {
             "GitHub on macOS with SwiftUI and OpenAI JSON API."
         )
     }
+
+    func testCorrectsCodingHomophonesInTechnicalContext() {
+        XCTAssertEqual(
+            polisher.polish("get her on maine branch and update the read me"),
+            "GitHub on main branch and update the README."
+        )
+    }
+
+    func testNormalizesOriginMainAndPullRequestVariants() {
+        XCTAssertEqual(
+            polisher.polish("open a pool request from origin maine after the merge"),
+            "Open a pull request from origin/main after the merge."
+        )
+    }
 }

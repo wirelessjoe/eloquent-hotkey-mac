@@ -137,7 +137,24 @@ struct TextPolisher {
             )
         }
 
+        if prefersCodingCorrections(in: output) {
+            for (pattern, replacement) in Self.codingContextReplacements {
+                output = pattern.stringByReplacingMatches(
+                    in: output,
+                    options: [],
+                    range: output.fullRange,
+                    withTemplate: replacement
+                )
+            }
+        }
+
         return output
+    }
+
+    private func prefersCodingCorrections(in input: String) -> Bool {
+        Self.codingContextHints.contains { pattern in
+            pattern.firstMatch(in: input, options: [], range: input.fullRange) != nil
+        }
     }
 
     private static let lineBreaksAndTabs = regex(#"[\t\r\n]+"#)
@@ -152,11 +169,13 @@ struct TextPolisher {
     private static let standaloneI = regex(#"(?i)\bi\b"#)
     private static let technicalPhraseReplacements: [(NSRegularExpression, String)] = [
         (regex(#"(?i)\bgit\s*hub\b"#), "GitHub"),
+        (regex(#"(?i)\bget\s+her\b"#), "GitHub"),
         (regex(#"(?i)\bmac\s*os\b"#), "macOS"),
         (regex(#"(?i)\bios\b"#), "iOS"),
         (regex(#"(?i)\bipad\s*os\b"#), "iPadOS"),
         (regex(#"(?i)\bwatch\s*os\b"#), "watchOS"),
         (regex(#"(?i)\bvision\s*os\b"#), "visionOS"),
+        (regex(#"(?i)\bread\s+me\b"#), "README"),
         (regex(#"(?i)\bswift\s*ui\b"#), "SwiftUI"),
         (regex(#"(?i)\bx\s*code\b"#), "Xcode"),
         (regex(#"(?i)\bopen\s*ai\b"#), "OpenAI"),
@@ -171,6 +190,31 @@ struct TextPolisher {
         (regex(#"(?i)\bjson\b"#), "JSON"),
         (regex(#"(?i)\bsql\b"#), "SQL"),
         (regex(#"(?i)\bcli\b"#), "CLI"),
+    ]
+    private static let codingContextHints: [NSRegularExpression] = [
+        regex(#"(?i)\bGitHub\b"#),
+        regex(#"(?i)\brepo(?:sitory)?\b"#),
+        regex(#"(?i)\bREADME\b"#),
+        regex(#"(?i)\bpull request\b"#),
+        regex(#"(?i)\bPR\b"#),
+        regex(#"(?i)\bbranch\b"#),
+        regex(#"(?i)\bcommit\b"#),
+        regex(#"(?i)\bmerge\b"#),
+        regex(#"(?i)\brebase\b"#),
+        regex(#"(?i)\bSwift(?:UI)?\b"#),
+        regex(#"(?i)\bXcode\b"#),
+        regex(#"(?i)\bCodex\b"#),
+        regex(#"(?i)\bOpenAI\b"#),
+        regex(#"(?i)\bJSON\b"#),
+        regex(#"(?i)\bAPI\b"#),
+        regex(#"(?i)\bCLI\b"#),
+        regex(#"(?i)\bTerminal\b"#),
+    ]
+    private static let codingContextReplacements: [(NSRegularExpression, String)] = [
+        (regex(#"(?i)\bmaine\b"#), "main"),
+        (regex(#"(?i)\borigin\s+main\b"#), "origin/main"),
+        (regex(#"(?i)\borigin\s+maine\b"#), "origin/main"),
+        (regex(#"(?i)\bpool\s+request\b"#), "pull request"),
     ]
 
     private static func regex(_ pattern: String) -> NSRegularExpression {

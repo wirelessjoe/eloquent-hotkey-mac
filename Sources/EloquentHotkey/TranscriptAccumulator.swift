@@ -12,81 +12,197 @@ struct TranscriptAccumulator {
         let recognizerTranscriptShrank: Bool
     }
 
-    private struct SegmentKey: Hashable {
-        let centiseconds: Int
-        let durationCentiseconds: Int
-    }
+    private static let duplicateTolerance: TimeInterval = 0.05
 
-    private var segmentTexts: [SegmentKey: String] = [:]
-    private var orderedKeys: [SegmentKey] = []
+    private var mergedSegments: [Segment] = []
     private var bestTranscript = ""
 
     mutating func ingest(formattedTranscript: String, segments: [Segment]) -> Update {
         let formatted = formattedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        merge(segments)
+        let normalizedSegments = normalized(segments)
+        if !normalizedSegments.isEmpty {
+            merge(normalizedSegments)
+        }
 
         let merged = mergedTranscript()
         let previousBest = bestTranscript
-        let preferred = preferredTranscript(formatted: formatted, merged: merged, previous: previousBest)
-        let recognizerTranscriptShrank = !formatted.isEmpty && transcriptScore(previousBest) > transcriptScore(formatted)
+        let preferred = preferredTranscript(
+            formatted: formatted,
+            merged: merged,
+            previous: previousBest
+        )
 
-        if transcriptScore(preferred) >= transcriptScore(bestTranscript) {
+        if !preferred.isEmpty {
             bestTranscript = preferred
         }
 
         return Update(
             transcript: bestTranscript,
-            recognizerTranscriptShrank: recognizerTranscriptShrank
+            recognizerTranscriptShrank: !formatted.isEmpty && bestTranscript != formatted
         )
     }
 
-    private mutating func merge(_ segments: [Segment]) {
+    private mutating func merge(_ newSegments: [Segment]) {
+        var updatedSegments = mergedSegments
+
+        for segment in newSegments {
+            updatedSegments.removeAll { existing in
+                shouldReplace(existing, with: segment)
+            }
+            updatedSegments.append(segment)
+        }
+
+        updatedSegments.sort(using: KeyPathComparator(\.timestamp))
+        mergedSegments = deduplicatedSegments(updatedSegments)
+    }
+
+    private func deduplicatedSegments(_ segments: [Segment]) -> [Segment] {
+        var result: [Segment] = []
+
         for segment in segments {
-            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else {
+            guard let previous = result.last else {
+                result.append(segment)
                 continue
             }
 
-            let key = SegmentKey(
-                centiseconds: Self.quantize(segment.timestamp),
-                durationCentiseconds: max(1, Self.quantize(segment.duration))
-            )
-
-            if segmentTexts.updateValue(text, forKey: key) == nil {
-                orderedKeys.append(key)
+            if isLikelyDuplicate(previous, segment) {
+                result[result.count - 1] = preferredDuplicateSegment(previous, segment)
+            } else {
+                result.append(segment)
             }
         }
 
-        orderedKeys.sort {
-            if $0.centiseconds == $1.centiseconds {
-                return $0.durationCentiseconds < $1.durationCentiseconds
-            }
-            return $0.centiseconds < $1.centiseconds
-        }
+        return result
     }
 
     private func mergedTranscript() -> String {
-        orderedKeys
-            .compactMap { segmentTexts[$0] }
+        mergedSegments
+            .map(\.text)
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func preferredTranscript(formatted: String, merged: String, previous: String) -> String {
-        [formatted, merged, previous]
-            .filter { !$0.isEmpty }
-            .max(by: { transcriptScore($0) < transcriptScore($1) }) ?? ""
+        guard !formatted.isEmpty else {
+            if !merged.isEmpty {
+                return merged
+            }
+            return previous
+        }
+
+        if shouldPreferMerged(formatted: formatted, merged: merged) {
+            return merged
+        }
+
+        if shouldPreservePrevious(previous: previous, current: formatted) {
+            return previous
+        }
+
+        return formatted
+    }
+
+    private func shouldPreferMerged(formatted: String, merged: String) -> Bool {
+        guard !merged.isEmpty else {
+            return false
+        }
+
+        let formattedScore = transcriptScore(formatted)
+        let mergedScore = transcriptScore(merged)
+        guard mergedScore > formattedScore else {
+            return false
+        }
+
+        let formattedWords = Self.normalizedWords(in: formatted)
+        let mergedWords = Self.normalizedWords(in: merged)
+        guard !formattedWords.isEmpty else {
+            return true
+        }
+
+        let orderedContainment = Self.orderedWordRetention(reference: formattedWords, candidate: mergedWords)
+        return orderedContainment >= 0.9 && mergedWords.count >= formattedWords.count + 2
+    }
+
+    private func shouldPreservePrevious(previous: String, current: String) -> Bool {
+        guard !previous.isEmpty else {
+            return false
+        }
+
+        let previousScore = transcriptScore(previous)
+        let currentScore = transcriptScore(current)
+        guard previousScore > 0 else {
+            return false
+        }
+
+        let shrinkRatio = Double(currentScore) / Double(previousScore)
+        if shrinkRatio >= 0.65 {
+            return false
+        }
+
+        return previous.localizedCaseInsensitiveContains(current)
     }
 
     private func transcriptScore(_ transcript: String) -> Int {
-        (Self.wordCount(in: transcript) * 1_000) + transcript.count
+        (Self.normalizedWords(in: transcript).count * 1_000) + transcript.count
     }
 
-    private static func wordCount(in text: String) -> Int {
-        text.split(whereSeparator: \.isWhitespace).count
+    private func normalized(_ segments: [Segment]) -> [Segment] {
+        segments
+            .map { segment in
+                Segment(
+                    timestamp: segment.timestamp,
+                    duration: max(segment.duration, 0.01),
+                    text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+            .filter { !$0.text.isEmpty }
+            .sorted(using: KeyPathComparator(\.timestamp))
     }
 
-    private static func quantize(_ interval: TimeInterval) -> Int {
-        Int((interval * 100).rounded())
+    private func shouldReplace(_ existing: Segment, with incoming: Segment) -> Bool {
+        let existingMidpoint = existing.timestamp + (existing.duration / 2)
+        let incomingMidpoint = incoming.timestamp + (incoming.duration / 2)
+        let threshold = max(min(existing.duration, incoming.duration) * 0.55, 0.08)
+        return abs(existingMidpoint - incomingMidpoint) <= threshold
+    }
+
+    private func isLikelyDuplicate(_ lhs: Segment, _ rhs: Segment) -> Bool {
+        guard lhs.text.compare(rhs.text, options: .caseInsensitive) == .orderedSame else {
+            return false
+        }
+
+        return abs(lhs.timestamp - rhs.timestamp) <= Self.duplicateTolerance
+    }
+
+    private func preferredDuplicateSegment(_ lhs: Segment, _ rhs: Segment) -> Segment {
+        transcriptScore(lhs.text) >= transcriptScore(rhs.text) ? lhs : rhs
+    }
+
+    private static func normalizedWords(in text: String) -> [String] {
+        text.lowercased().split(whereSeparator: { character in
+            !(character.isLetter || character.isNumber || character == "/" || character == "_" || character == "-")
+        }).map(String.init)
+    }
+
+    private static func orderedWordRetention(reference: [String], candidate: [String]) -> Double {
+        guard !reference.isEmpty else {
+            return 1
+        }
+
+        var candidateIndex = 0
+        var matches = 0
+
+        for word in reference {
+            while candidateIndex < candidate.count {
+                if candidate[candidateIndex] == word {
+                    matches += 1
+                    candidateIndex += 1
+                    break
+                }
+
+                candidateIndex += 1
+            }
+        }
+
+        return Double(matches) / Double(reference.count)
     }
 }
