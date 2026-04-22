@@ -6,6 +6,8 @@
 
 `EloquentHotkey` is a fast macOS menu bar dictation app built for one job: hold a shortcut, talk, release, and get cleaned-up text back in the app you were already using.
 
+Licensed under the [MIT License](LICENSE).
+
 It is inspired by the workflow of Google AI Edge Eloquent, but it is an independent macOS app built with Apple's speech stack, Apple-friendly on-device cleanup when available, and a lightweight local fallback when it is not.
 
 ## Why it exists
@@ -42,7 +44,7 @@ That means:
 4. Release the shortcut.
 5. The app cleans the transcript and pastes it back where you were working.
 
-If auto-paste misses, the cleaned result is still on the clipboard and available through `Paste Last Result` or `Copy Last Result`.
+If auto-paste misses, the cleaned result is still saved in the app and available through `Paste Last Result` or `Copy Last Result`.
 
 ## Cleanup behavior
 
@@ -121,3 +123,7 @@ $(swift build -c release --show-bin-path)/EloquentHotkey
 - This project recreates the product experience, not Google's private implementation.
 - It does not use Google's code, models, or assets.
 - It is designed to feel fast first, with better cleanup layered in when the local system can support it.
+
+## Author
+
+- Twitter: [@wirelessjoe](https://twitter.com/wirelessjoe)

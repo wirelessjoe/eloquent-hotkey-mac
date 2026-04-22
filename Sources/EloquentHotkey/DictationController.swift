@@ -11,11 +11,13 @@ struct DictationConfiguration {
 }
 
 final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private static let minimumReadyBufferedAudio: TimeInterval = 0.18
     private static let stopFlushGracePeriod: TimeInterval = 0.35
     private static let stopNoSpeechTimeout: TimeInterval = 0.9
     private static let logger = Logger(subsystem: "dev.codex.EloquentHotkey", category: "Dictation")
 
     private let configuration: DictationConfiguration
+    private let onReady: (@MainActor @Sendable () -> Void)?
     private let engineQueue = DispatchQueue(label: "dev.codex.EloquentHotkey.dictation")
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
 
@@ -35,9 +37,17 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
     private var stopRequestedAt: Date?
     private var audioCaptureEnded = false
     private var loggedQuietInputBoost = false
+    private var didSignalReady = false
+    private var bufferedStartupAudio: [AVAudioPCMBuffer] = []
+    private var bufferedStartupAudioDuration: TimeInterval = 0
+    private var didLogFirstTranscript = false
 
-    init(configuration: DictationConfiguration) {
+    init(
+        configuration: DictationConfiguration,
+        onReady: (@MainActor @Sendable () -> Void)? = nil
+    ) {
         self.configuration = configuration
+        self.onReady = onReady
     }
 
     func captureAndTranscribe() async throws -> String {
@@ -104,6 +114,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
             request.contextualStrings = CodingLexicon.contextualPhrases
+            request.taskHint = .dictation
             if #available(macOS 13, *) {
                 request.addsPunctuation = true
             }
@@ -122,6 +133,10 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             self.isFinishing = false
             self.audioCaptureEnded = false
             self.loggedQuietInputBoost = false
+            self.didSignalReady = false
+            self.bufferedStartupAudio.removeAll(keepingCapacity: true)
+            self.bufferedStartupAudioDuration = 0
+            self.didLogFirstTranscript = false
 
             self.recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
                 guard let self else {
@@ -140,6 +155,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             captureSession.startRunning()
 
             if stopRequestedAt != nil {
+                flushBufferedStartupAudioIfNeeded(into: request, signalReady: false, reason: "stop requested before microphone primed")
                 endAudioCaptureIfNeeded()
                 finishIfStopRequestExpired()
             }
@@ -178,6 +194,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
                 if !transcript.isEmpty {
                     sawSpeech = true
                     lastTranscriptChangeAt = Date()
+                    logFirstTranscriptIfNeeded(for: result, transcript: transcript)
                 }
             }
 
@@ -186,7 +203,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             }
 
             if result.isFinal {
-                Self.logger.debug("Speech recognizer produced a final result")
+                logFinalTranscript(result, transcript: transcript)
                 finishWithCurrentTranscript()
                 return
             }
@@ -308,6 +325,10 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
 
         stopRequestedAt = nil
         audioCaptureEnded = false
+        bufferedStartupAudio.removeAll(keepingCapacity: false)
+        bufferedStartupAudioDuration = 0
+        didSignalReady = false
+        didLogFirstTranscript = false
     }
 
     private func endAudioCaptureIfNeeded() {
@@ -331,9 +352,76 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         }
 
         if let boostedBuffer = recognitionBuffer(from: sampleBuffer) {
-            request.append(boostedBuffer)
+            appendAudioForRecognition(boostedBuffer, into: request)
         } else {
+            if !didSignalReady {
+                signalReadyIfNeeded(
+                    bufferedAudioDuration: bufferedStartupAudioDuration,
+                    reason: "microphone delivered raw audio"
+                )
+            }
             request.appendAudioSampleBuffer(sampleBuffer)
+        }
+    }
+
+    private func appendAudioForRecognition(
+        _ buffer: AVAudioPCMBuffer,
+        into request: SFSpeechAudioBufferRecognitionRequest
+    ) {
+        guard !didSignalReady else {
+            request.append(buffer)
+            return
+        }
+
+        bufferedStartupAudio.append(buffer)
+        bufferedStartupAudioDuration += duration(of: buffer)
+
+        if bufferedStartupAudioDuration >= Self.minimumReadyBufferedAudio {
+            flushBufferedStartupAudioIfNeeded(
+                into: request,
+                signalReady: stopRequestedAt == nil,
+                reason: "microphone primed with live audio"
+            )
+        }
+    }
+
+    private func flushBufferedStartupAudioIfNeeded(
+        into request: SFSpeechAudioBufferRecognitionRequest,
+        signalReady: Bool,
+        reason: StaticString
+    ) {
+        let bufferedAudioDuration = bufferedStartupAudioDuration
+        if !bufferedStartupAudio.isEmpty {
+            for bufferedBuffer in bufferedStartupAudio {
+                request.append(bufferedBuffer)
+            }
+            bufferedStartupAudio.removeAll(keepingCapacity: true)
+            bufferedStartupAudioDuration = 0
+        }
+
+        if signalReady {
+            signalReadyIfNeeded(
+                bufferedAudioDuration: bufferedAudioDuration,
+                reason: reason
+            )
+        }
+    }
+
+    private func signalReadyIfNeeded(
+        bufferedAudioDuration: TimeInterval,
+        reason: StaticString
+    ) {
+        guard !didSignalReady, stopRequestedAt == nil else {
+            return
+        }
+
+        didSignalReady = true
+        let startupLatency = Date().timeIntervalSince(startedAt)
+        Self.logger.notice(
+            "Recognizer primed after \(startupLatency, privacy: .public)s with \(bufferedAudioDuration, privacy: .public)s of startup audio buffered; reason=\(reason, privacy: .public)"
+        )
+        Task { @MainActor [onReady] in
+            onReady?()
         }
     }
 
@@ -432,5 +520,50 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         }
 
         return gain
+    }
+
+    private func logFirstTranscriptIfNeeded(
+        for result: SFSpeechRecognitionResult,
+        transcript: String
+    ) {
+        guard !didLogFirstTranscript else {
+            return
+        }
+
+        didLogFirstTranscript = true
+        let elapsedSinceStart = Date().timeIntervalSince(startedAt)
+        let firstSegmentTimestamp = result.bestTranscription.segments.first?.timestamp ?? 0
+        let lastSegmentEnd = result.bestTranscription.segments.last.map { $0.timestamp + $0.duration } ?? 0
+
+        Self.logger.notice(
+            "First transcript arrived after \(elapsedSinceStart, privacy: .public)s; firstSegment=\(firstSegmentTimestamp, privacy: .public)s lastSegmentEnd=\(lastSegmentEnd, privacy: .public)s chars=\(transcript.count, privacy: .public)"
+        )
+
+        if firstSegmentTimestamp >= 0.6 {
+            Self.logger.notice(
+                "Recognizer's first segment started \(firstSegmentTimestamp, privacy: .public)s into captured audio; the opening words were likely missed before transcription stabilized"
+            )
+        }
+    }
+
+    private func logFinalTranscript(
+        _ result: SFSpeechRecognitionResult,
+        transcript: String
+    ) {
+        let elapsedSinceStart = Date().timeIntervalSince(startedAt)
+        let firstSegmentTimestamp = result.bestTranscription.segments.first?.timestamp ?? 0
+        let lastSegmentEnd = result.bestTranscription.segments.last.map { $0.timestamp + $0.duration } ?? 0
+
+        Self.logger.notice(
+            "Speech recognizer produced a final result after \(elapsedSinceStart, privacy: .public)s; firstSegment=\(firstSegmentTimestamp, privacy: .public)s lastSegmentEnd=\(lastSegmentEnd, privacy: .public)s chars=\(transcript.count, privacy: .public)"
+        )
+    }
+
+    private func duration(of buffer: AVAudioPCMBuffer) -> TimeInterval {
+        guard buffer.format.sampleRate > 0 else {
+            return 0
+        }
+
+        return Double(buffer.frameLength) / buffer.format.sampleRate
     }
 }

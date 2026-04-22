@@ -6,6 +6,7 @@ import OSLog
 @MainActor
 final class AppModel: ObservableObject {
     @Published private(set) var availableMicrophones: [MicrophoneOption] = []
+    @Published private(set) var isArming = false
     @Published private(set) var isListening = false
     @Published private(set) var isCleaningUp = false
     @Published private(set) var lastText: String
@@ -162,7 +163,7 @@ final class AppModel: ObservableObject {
             return
         }
 
-        if isListening {
+        if isArming || isListening {
             stopDictation()
         } else {
             startDictation(trigger: .manual)
@@ -225,15 +226,15 @@ final class AppModel: ObservableObject {
     }
 
     private func startDictation(trigger: DictationTrigger) {
-        guard !isListening, !isCleaningUp else {
+        guard !isArming, !isListening, !isCleaningUp else {
             return
         }
 
-        statusMessage = "Listening with \(selectedMicrophoneName)…"
-        isListening = true
+        statusMessage = "Starting microphone…"
+        isArming = true
+        isListening = false
         isCleaningUp = false
-        logger.debug("Starting dictation via \(trigger.logName, privacy: .public)")
-        SoundEffect.playStartRecording()
+        logger.notice("Starting dictation via \(trigger.logName, privacy: .public)")
 
         let targetApplication = currentTargetApplication()
         let config = DictationConfiguration(
@@ -242,7 +243,19 @@ final class AppModel: ObservableObject {
             maxDuration: maxDuration,
             autoStopOnSilence: trigger.autoStopOnSilence
         )
-        let dictation = DictationController(configuration: config)
+        let dictation = DictationController(
+            configuration: config,
+            onReady: { [weak self] in
+                guard let self, self.activeDictation != nil, self.isArming else {
+                    return
+                }
+
+                self.isArming = false
+                self.isListening = true
+                self.statusMessage = "Listening with \(self.selectedMicrophoneName)…"
+                SoundEffect.playStartRecording()
+            }
+        )
 
         activeDictation = dictation
         dictationTask?.cancel()
@@ -273,16 +286,17 @@ final class AppModel: ObservableObject {
     }
 
     private func stopDictation() {
-        guard isListening else {
+        guard activeDictation != nil || isArming || isListening else {
             return
         }
 
         statusMessage = "Finishing dictation…"
-        logger.debug("Stop requested from UI or key release")
+        logger.notice("Stop requested from UI or key release")
         activeDictation?.requestStop()
     }
 
     private func beginCleanupPhase() {
+        isArming = false
         isListening = false
         isCleaningUp = true
         activeDictation = nil
@@ -294,6 +308,7 @@ final class AppModel: ObservableObject {
 
         activeDictation = nil
         dictationTask = nil
+        isArming = false
         isListening = false
         isCleaningUp = false
         SoundEffect.playFinishRecording()
@@ -334,6 +349,7 @@ final class AppModel: ObservableObject {
     private func failDictation(with error: Error) {
         activeDictation = nil
         dictationTask = nil
+        isArming = false
         isListening = false
         isCleaningUp = false
         SoundEffect.playFinishRecording()

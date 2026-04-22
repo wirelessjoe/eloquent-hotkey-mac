@@ -12,169 +12,172 @@ struct TranscriptAccumulator {
         let recognizerTranscriptShrank: Bool
     }
 
-    private static let duplicateTolerance: TimeInterval = 0.05
+    private struct Snapshot {
+        let transcript: String
+        let words: [String]
+        let firstSegmentStart: TimeInterval
+        let lastSegmentEnd: TimeInterval
 
-    private var mergedSegments: [Segment] = []
-    private var bestTranscript = ""
+        var score: Int {
+            (words.count * 1_000) + transcript.count
+        }
+    }
+
+    private var bestSnapshot: Snapshot?
 
     mutating func ingest(formattedTranscript: String, segments: [Segment]) -> Update {
-        let formatted = formattedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedSegments = normalized(segments)
-        if !normalizedSegments.isEmpty {
-            merge(normalizedSegments)
+        let currentTranscript = formattedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !currentTranscript.isEmpty else {
+            return Update(
+                transcript: bestSnapshot?.transcript ?? "",
+                recognizerTranscriptShrank: false
+            )
         }
 
-        let merged = mergedTranscript()
-        let previousBest = bestTranscript
-        let preferred = preferredTranscript(
-            formatted: formatted,
-            merged: merged,
-            previous: previousBest
+        let currentSnapshot = makeSnapshot(
+            transcript: currentTranscript,
+            segments: segments
         )
 
-        if !preferred.isEmpty {
-            bestTranscript = preferred
+        guard let bestSnapshot else {
+            self.bestSnapshot = currentSnapshot
+            return Update(
+                transcript: currentSnapshot.transcript,
+                recognizerTranscriptShrank: false
+            )
+        }
+
+        if shouldReplaceBest(previous: bestSnapshot, current: currentSnapshot) {
+            self.bestSnapshot = currentSnapshot
+            return Update(
+                transcript: currentSnapshot.transcript,
+                recognizerTranscriptShrank: false
+            )
         }
 
         return Update(
-            transcript: bestTranscript,
-            recognizerTranscriptShrank: !formatted.isEmpty && bestTranscript != formatted
+            transcript: bestSnapshot.transcript,
+            recognizerTranscriptShrank: bestSnapshot.transcript != currentSnapshot.transcript
         )
     }
 
-    private mutating func merge(_ newSegments: [Segment]) {
-        var updatedSegments = mergedSegments
+    private func makeSnapshot(transcript: String, segments: [Segment]) -> Snapshot {
+        let words = Self.normalizedWords(in: transcript)
+        let trimmedSegments = segments.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let firstSegmentStart = trimmedSegments.first?.timestamp ?? 0
+        let lastSegmentEnd = trimmedSegments.last.map { $0.timestamp + $0.duration } ?? 0
 
-        for segment in newSegments {
-            updatedSegments.removeAll { existing in
-                shouldReplace(existing, with: segment)
-            }
-            updatedSegments.append(segment)
-        }
-
-        updatedSegments.sort(using: KeyPathComparator(\.timestamp))
-        mergedSegments = deduplicatedSegments(updatedSegments)
+        return Snapshot(
+            transcript: transcript,
+            words: words,
+            firstSegmentStart: firstSegmentStart,
+            lastSegmentEnd: lastSegmentEnd
+        )
     }
 
-    private func deduplicatedSegments(_ segments: [Segment]) -> [Segment] {
-        var result: [Segment] = []
-
-        for segment in segments {
-            guard let previous = result.last else {
-                result.append(segment)
-                continue
-            }
-
-            if isLikelyDuplicate(previous, segment) {
-                result[result.count - 1] = preferredDuplicateSegment(previous, segment)
-            } else {
-                result.append(segment)
-            }
-        }
-
-        return result
-    }
-
-    private func mergedTranscript() -> String {
-        mergedSegments
-            .map(\.text)
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func preferredTranscript(formatted: String, merged: String, previous: String) -> String {
-        guard !formatted.isEmpty else {
-            if !merged.isEmpty {
-                return merged
-            }
-            return previous
-        }
-
-        if shouldPreferMerged(formatted: formatted, merged: merged) {
-            return merged
-        }
-
-        if shouldPreservePrevious(previous: previous, current: formatted) {
-            return previous
-        }
-
-        return formatted
-    }
-
-    private func shouldPreferMerged(formatted: String, merged: String) -> Bool {
-        guard !merged.isEmpty else {
+    private func shouldReplaceBest(previous: Snapshot, current: Snapshot) -> Bool {
+        guard !current.words.isEmpty else {
             return false
         }
 
-        let formattedScore = transcriptScore(formatted)
-        let mergedScore = transcriptScore(merged)
-        guard mergedScore > formattedScore else {
-            return false
-        }
-
-        let formattedWords = Self.normalizedWords(in: formatted)
-        let mergedWords = Self.normalizedWords(in: merged)
-        guard !formattedWords.isEmpty else {
+        if isLikelyWrappedDuplicate(previous: previous.words, current: current.words) {
             return true
         }
 
-        let orderedContainment = Self.orderedWordRetention(reference: formattedWords, candidate: mergedWords)
-        return orderedContainment >= 0.9 && mergedWords.count >= formattedWords.count + 2
-    }
-
-    private func shouldPreservePrevious(previous: String, current: String) -> Bool {
-        guard !previous.isEmpty else {
+        if isClearRegression(previous: previous, current: current) {
             return false
         }
 
-        let previousScore = transcriptScore(previous)
-        let currentScore = transcriptScore(current)
-        guard previousScore > 0 else {
+        let startDelta = current.firstSegmentStart - previous.firstSegmentStart
+        let endDelta = current.lastSegmentEnd - previous.lastSegmentEnd
+        let currentRetentionInPrevious = Self.orderedWordRetention(
+            reference: current.words,
+            candidate: previous.words
+        )
+        let previousRetentionInCurrent = Self.orderedWordRetention(
+            reference: previous.words,
+            candidate: current.words
+        )
+        let timingSimilar = abs(startDelta) <= 0.35 && abs(endDelta) <= 0.5
+
+        if timingSimilar && current.transcript != previous.transcript {
+            return true
+        }
+
+        if current.firstSegmentStart + 0.5 < previous.firstSegmentStart {
+            return true
+        }
+
+        if endDelta > 0.6 && current.firstSegmentStart <= previous.firstSegmentStart + 0.75 {
+            return true
+        }
+
+        if current.score > previous.score,
+           current.firstSegmentStart <= previous.firstSegmentStart + 0.5,
+           current.lastSegmentEnd >= previous.lastSegmentEnd - 0.2 {
+            return true
+        }
+
+        if current.score >= previous.score,
+           previousRetentionInCurrent >= 0.88,
+           currentRetentionInPrevious < 0.98 {
+            return true
+        }
+
+        return false
+    }
+
+    private func isClearRegression(previous: Snapshot, current: Snapshot) -> Bool {
+        guard !previous.words.isEmpty, !current.words.isEmpty else {
             return false
         }
 
-        let shrinkRatio = Double(currentScore) / Double(previousScore)
-        if shrinkRatio >= 0.65 {
+        let wordLoss = previous.words.count - current.words.count
+        let startDelta = current.firstSegmentStart - previous.firstSegmentStart
+        let endDelta = current.lastSegmentEnd - previous.lastSegmentEnd
+        let currentRetentionInPrevious = Self.orderedWordRetention(
+            reference: current.words,
+            candidate: previous.words
+        )
+
+        if startDelta >= 0.75,
+           wordLoss >= 2,
+           currentRetentionInPrevious >= 0.9,
+           endDelta <= 0.5 {
+            return true
+        }
+
+        if wordLoss >= 2,
+           currentRetentionInPrevious >= 0.95,
+           startDelta >= -0.1,
+           endDelta <= 0.25 {
+            return true
+        }
+
+        return false
+    }
+
+    private func isLikelyWrappedDuplicate(previous: [String], current: [String]) -> Bool {
+        guard previous.count > current.count else {
             return false
         }
 
-        return previous.localizedCaseInsensitiveContains(current)
-    }
-
-    private func transcriptScore(_ transcript: String) -> Int {
-        (Self.normalizedWords(in: transcript).count * 1_000) + transcript.count
-    }
-
-    private func normalized(_ segments: [Segment]) -> [Segment] {
-        segments
-            .map { segment in
-                Segment(
-                    timestamp: segment.timestamp,
-                    duration: max(segment.duration, 0.01),
-                    text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                )
-            }
-            .filter { !$0.text.isEmpty }
-            .sorted(using: KeyPathComparator(\.timestamp))
-    }
-
-    private func shouldReplace(_ existing: Segment, with incoming: Segment) -> Bool {
-        let existingMidpoint = existing.timestamp + (existing.duration / 2)
-        let incomingMidpoint = incoming.timestamp + (incoming.duration / 2)
-        let threshold = max(min(existing.duration, incoming.duration) * 0.55, 0.08)
-        return abs(existingMidpoint - incomingMidpoint) <= threshold
-    }
-
-    private func isLikelyDuplicate(_ lhs: Segment, _ rhs: Segment) -> Bool {
-        guard lhs.text.compare(rhs.text, options: .caseInsensitive) == .orderedSame else {
+        let extraWordCount = previous.count - current.count
+        guard extraWordCount >= 1 else {
             return false
         }
 
-        return abs(lhs.timestamp - rhs.timestamp) <= Self.duplicateTolerance
-    }
+        if Array(previous.suffix(current.count)) == current {
+            let duplicatedPrefix = Array(previous.prefix(extraWordCount))
+            return duplicatedPrefix == Array(current.suffix(extraWordCount))
+        }
 
-    private func preferredDuplicateSegment(_ lhs: Segment, _ rhs: Segment) -> Segment {
-        transcriptScore(lhs.text) >= transcriptScore(rhs.text) ? lhs : rhs
+        if Array(previous.prefix(current.count)) == current {
+            let duplicatedSuffix = Array(previous.suffix(extraWordCount))
+            return duplicatedSuffix == Array(current.prefix(extraWordCount))
+        }
+
+        return false
     }
 
     private static func normalizedWords(in text: String) -> [String] {
