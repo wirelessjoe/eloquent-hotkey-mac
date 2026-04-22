@@ -50,7 +50,7 @@ actor TranscriptCleaner {
                     return polished
                 }
 
-                logger.warning("Discarded Apple cleanup result because it looked too different from the fallback transcript")
+                logger.notice("Discarded Apple cleanup result because it removed or rewrote too much of the fallback transcript")
             } catch {
                 logger.warning("Apple cleanup failed: \(error.localizedDescription, privacy: .public)")
             }
@@ -66,7 +66,51 @@ actor TranscriptCleaner {
         }
 
         let ratio = Double(cleaned.count) / Double(max(fallback.count, 1))
-        return ratio >= 0.4 && ratio <= 1.6
+        let fallbackWords = Self.normalizedWords(in: fallback)
+        guard fallbackWords.count >= 6 else {
+            return ratio >= 0.4 && ratio <= 1.6
+        }
+
+        guard ratio >= 0.8 && ratio <= 1.25 else {
+            return false
+        }
+
+        let cleanedWords = Self.normalizedWords(in: cleaned)
+        guard cleanedWords.count >= max(fallbackWords.count - 2, 1) else {
+            return false
+        }
+
+        let retention = Self.orderedWordRetention(reference: fallbackWords, candidate: cleanedWords)
+        return retention >= 0.88
+    }
+
+    private static func normalizedWords(in text: String) -> [String] {
+        text.lowercased().split(whereSeparator: { character in
+            !(character.isLetter || character.isNumber || character == "/" || character == "_" || character == "-")
+        }).map(String.init)
+    }
+
+    private static func orderedWordRetention(reference: [String], candidate: [String]) -> Double {
+        guard !reference.isEmpty else {
+            return 1
+        }
+
+        var candidateIndex = 0
+        var matches = 0
+
+        for word in reference {
+            while candidateIndex < candidate.count {
+                if candidate[candidateIndex] == word {
+                    matches += 1
+                    candidateIndex += 1
+                    break
+                }
+
+                candidateIndex += 1
+            }
+        }
+
+        return Double(matches) / Double(reference.count)
     }
 }
 
@@ -121,6 +165,7 @@ private enum AppleTranscriptCleanupEngine {
             Preserve and correct developer and product names like GitHub, macOS, iOS, iPadOS, watchOS, visionOS, Swift, SwiftUI, Xcode, OpenAI, ChatGPT, JavaScript, TypeScript, GraphQL, PostgreSQL, API, URL, JSON, SQL, and CLI.
             Remove only obvious filler words or false starts.
             Do not add commentary, explanations, or markdown.
+            \(CodingLexicon.cleanupGuidance)
             """
         }
 

@@ -34,6 +34,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
     private var isFinishing = false
     private var stopRequestedAt: Date?
     private var audioCaptureEnded = false
+    private var loggedQuietInputBoost = false
 
     init(configuration: DictationConfiguration) {
         self.configuration = configuration
@@ -85,6 +86,13 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             captureSession.addInput(input)
 
             let output = AVCaptureAudioDataOutput()
+            output.audioSettings = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsNonInterleaved: true,
+                AVLinearPCMIsBigEndianKey: false,
+            ]
             output.setSampleBufferDelegate(self, queue: engineQueue)
 
             guard captureSession.canAddOutput(output) else {
@@ -95,6 +103,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
 
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
+            request.contextualStrings = CodingLexicon.contextualPhrases
             if #available(macOS 13, *) {
                 request.addsPunctuation = true
             }
@@ -112,6 +121,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             self.sawSpeech = false
             self.isFinishing = false
             self.audioCaptureEnded = false
+            self.loggedQuietInputBoost = false
 
             self.recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
                 guard let self else {
@@ -153,11 +163,11 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         if let result {
             let update = transcriptAccumulator.ingest(
                 formattedTranscript: result.bestTranscription.formattedString,
-                segments: result.bestTranscription.segments.map {
+                segments: result.bestTranscription.segments.map { segment in
                     TranscriptAccumulator.Segment(
-                        timestamp: $0.timestamp,
-                        duration: $0.duration,
-                        text: $0.substring
+                        timestamp: segment.timestamp,
+                        duration: segment.duration,
+                        text: segment.substring
                     )
                 }
             )
@@ -172,7 +182,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             }
 
             if update.recognizerTranscriptShrank {
-                Self.logger.notice("Recognizer returned a shorter transcript snapshot; preserving the longer accumulated transcript")
+                Self.logger.notice("Recognizer returned a less complete transcript snapshot; preserving the more complete accumulated transcript")
             }
 
             if result.isFinal {
@@ -320,6 +330,107 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             return
         }
 
-        request.appendAudioSampleBuffer(sampleBuffer)
+        if let boostedBuffer = recognitionBuffer(from: sampleBuffer) {
+            request.append(boostedBuffer)
+        } else {
+            request.appendAudioSampleBuffer(sampleBuffer)
+        }
+    }
+
+    private func recognitionBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription),
+              let audioFormat = AVAudioFormat(streamDescription: streamDescription)
+        else {
+            return nil
+        }
+
+        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frameCount > 0,
+              let pcmBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: frameCount)
+        else {
+            return nil
+        }
+
+        pcmBuffer.frameLength = frameCount
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(frameCount),
+            into: pcmBuffer.mutableAudioBufferList
+        )
+        guard status == noErr else {
+            Self.logger.debug("Falling back to raw sample-buffer append because PCM conversion failed with status \(status, privacy: .public)")
+            return nil
+        }
+
+        if let gain = applyAdaptiveGain(to: pcmBuffer), !loggedQuietInputBoost {
+            loggedQuietInputBoost = true
+            Self.logger.notice("Boosted quiet microphone input by \(gain, privacy: .public)x for speech recognition")
+        }
+
+        return pcmBuffer
+    }
+
+    private func applyAdaptiveGain(to buffer: AVAudioPCMBuffer) -> Float? {
+        guard buffer.format.commonFormat == .pcmFormatFloat32,
+              let channelData = buffer.floatChannelData
+        else {
+            return nil
+        }
+
+        let frameLength = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frameLength > 0, channelCount > 0 else {
+            return nil
+        }
+
+        let stride = Int(buffer.stride)
+        var sumSquares: Float = 0
+        var peak: Float = 0
+
+        for channelIndex in 0..<channelCount {
+            let samples = channelData[channelIndex]
+            var sampleIndex = 0
+
+            for _ in 0..<frameLength {
+                let sample = samples[sampleIndex]
+                let magnitude = abs(sample)
+                sumSquares += sample * sample
+                peak = max(peak, magnitude)
+                sampleIndex += stride
+            }
+        }
+
+        guard peak > 0 else {
+            return nil
+        }
+
+        let sampleCount = Float(frameLength * channelCount)
+        let rms = sqrt(sumSquares / max(sampleCount, 1))
+        let minimumBoostableRMS: Float = 0.018
+        guard rms < minimumBoostableRMS else {
+            return nil
+        }
+
+        let targetRMS: Float = 0.05
+        let requestedGain = targetRMS / max(rms, 0.0005)
+        let headroomGain = 0.92 / peak
+        let gain = min(requestedGain, headroomGain, 4.0)
+        guard gain > 1.1 else {
+            return nil
+        }
+
+        for channelIndex in 0..<channelCount {
+            let samples = channelData[channelIndex]
+            var sampleIndex = 0
+
+            for _ in 0..<frameLength {
+                samples[sampleIndex] *= gain
+                sampleIndex += stride
+            }
+        }
+
+        return gain
     }
 }

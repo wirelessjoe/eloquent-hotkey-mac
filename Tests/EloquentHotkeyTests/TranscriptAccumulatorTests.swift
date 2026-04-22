@@ -8,14 +8,14 @@ final class TranscriptAccumulatorTests: XCTestCase {
         let first = accumulator.ingest(
             formattedTranscript: "hello there this is a much longer message",
             segments: [
-                .init(timestamp: 0.0, duration: 0.2, text: "hello"),
-                .init(timestamp: 0.2, duration: 0.2, text: "there"),
-                .init(timestamp: 0.4, duration: 0.2, text: "this"),
-                .init(timestamp: 0.6, duration: 0.2, text: "is"),
-                .init(timestamp: 0.8, duration: 0.2, text: "a"),
-                .init(timestamp: 1.0, duration: 0.2, text: "much"),
-                .init(timestamp: 1.2, duration: 0.2, text: "longer"),
-                .init(timestamp: 1.4, duration: 0.2, text: "message"),
+                segment(0.00, "hello"),
+                segment(0.20, "there"),
+                segment(0.40, "this"),
+                segment(0.60, "is"),
+                segment(0.80, "a"),
+                segment(1.00, "much"),
+                segment(1.20, "longer"),
+                segment(1.40, "message"),
             ]
         )
 
@@ -25,8 +25,8 @@ final class TranscriptAccumulatorTests: XCTestCase {
         let second = accumulator.ingest(
             formattedTranscript: "longer message",
             segments: [
-                .init(timestamp: 1.2, duration: 0.2, text: "longer"),
-                .init(timestamp: 1.4, duration: 0.2, text: "message"),
+                segment(1.20, "longer"),
+                segment(1.40, "message"),
             ]
         )
 
@@ -34,27 +34,39 @@ final class TranscriptAccumulatorTests: XCTestCase {
         XCTAssertTrue(second.recognizerTranscriptShrank)
     }
 
-    func testMergesSegmentsAcrossCallbacks() {
+    func testKeepsMissingMiddleChunkFromEarlierSegments() {
         var accumulator = TranscriptAccumulator()
 
         _ = accumulator.ingest(
-            formattedTranscript: "hello there",
+            formattedTranscript: "please commit the change and push to GitHub now",
             segments: [
-                .init(timestamp: 0.0, duration: 0.2, text: "hello"),
-                .init(timestamp: 0.2, duration: 0.2, text: "there"),
+                segment(0.00, "please"),
+                segment(0.20, "commit"),
+                segment(0.40, "the"),
+                segment(0.60, "change"),
+                segment(0.80, "and"),
+                segment(1.00, "push"),
+                segment(1.20, "to"),
+                segment(1.40, "GitHub"),
+                segment(1.60, "now"),
             ]
         )
 
         let update = accumulator.ingest(
-            formattedTranscript: "this is new",
+            formattedTranscript: "please commit and push to GitHub now",
             segments: [
-                .init(timestamp: 0.4, duration: 0.2, text: "this"),
-                .init(timestamp: 0.6, duration: 0.2, text: "is"),
-                .init(timestamp: 0.8, duration: 0.2, text: "new"),
+                segment(0.00, "please"),
+                segment(0.20, "commit"),
+                segment(0.80, "and"),
+                segment(1.00, "push"),
+                segment(1.20, "to"),
+                segment(1.40, "GitHub"),
+                segment(1.60, "now"),
             ]
         )
 
-        XCTAssertEqual(update.transcript, "hello there this is new")
+        XCTAssertEqual(update.transcript, "please commit the change and push to GitHub now")
+        XCTAssertTrue(update.recognizerTranscriptShrank)
     }
 
     func testLetsRevisedSegmentReplaceEarlierTextForSameTiming() {
@@ -63,19 +75,50 @@ final class TranscriptAccumulatorTests: XCTestCase {
         _ = accumulator.ingest(
             formattedTranscript: "ship it",
             segments: [
-                .init(timestamp: 0.0, duration: 0.2, text: "ship"),
-                .init(timestamp: 0.2, duration: 0.2, text: "it"),
+                segment(0.00, "ship"),
+                segment(0.20, "it"),
             ]
         )
 
         let update = accumulator.ingest(
             formattedTranscript: "shift it",
             segments: [
-                .init(timestamp: 0.0, duration: 0.2, text: "shift"),
-                .init(timestamp: 0.2, duration: 0.2, text: "it"),
+                segment(0.00, "shift"),
+                segment(0.20, "it"),
             ]
         )
 
         XCTAssertEqual(update.transcript, "shift it")
+        XCTAssertFalse(update.recognizerTranscriptShrank)
+    }
+
+    func testAllowsLongerFollowUpTranscriptWithoutDuplicatingWords() {
+        var accumulator = TranscriptAccumulator()
+
+        _ = accumulator.ingest(
+            formattedTranscript: "hello there",
+            segments: [
+                segment(0.00, "hello"),
+                segment(0.20, "there"),
+            ]
+        )
+
+        let update = accumulator.ingest(
+            formattedTranscript: "hello there this is new",
+            segments: [
+                segment(0.00, "hello"),
+                segment(0.20, "there"),
+                segment(0.40, "this"),
+                segment(0.60, "is"),
+                segment(0.80, "new"),
+            ]
+        )
+
+        XCTAssertEqual(update.transcript, "hello there this is new")
+        XCTAssertFalse(update.recognizerTranscriptShrank)
+    }
+
+    private func segment(_ timestamp: TimeInterval, _ text: String) -> TranscriptAccumulator.Segment {
+        .init(timestamp: timestamp, duration: 0.18, text: text)
     }
 }

@@ -135,7 +135,9 @@ private struct MenuBarLabelView: View {
 private struct StatusMenuView: View {
     @ObservedObject var model: AppModel
 
-    private static let transcriptPreviewWidth: CGFloat = 280
+    private static let transcriptPreviewWidth: CGFloat = 240
+    private static let transcriptPreviewMaxLines = 5
+    private static let transcriptPreviewMaxCharactersPerLine = 24
 
     var body: some View {
         Button(primaryActionTitle) {
@@ -162,10 +164,10 @@ private struct StatusMenuView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Text(model.lastText)
+                Text(wrappedTranscriptPreview)
                     .font(.callout)
                     .multilineTextAlignment(.leading)
-                    .lineLimit(5)
+                    .lineLimit(Self.transcriptPreviewMaxLines)
                     .truncationMode(.tail)
                     .frame(width: Self.transcriptPreviewWidth, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
@@ -199,6 +201,62 @@ private struct StatusMenuView: View {
         }
 
         return model.isListening ? "Stop Dictation" : "Start Dictation"
+    }
+
+    private var wrappedTranscriptPreview: String {
+        Self.wrapPreview(
+            model.lastText,
+            maxCharactersPerLine: Self.transcriptPreviewMaxCharactersPerLine,
+            maxLines: Self.transcriptPreviewMaxLines
+        )
+    }
+
+    private static func wrapPreview(
+        _ text: String,
+        maxCharactersPerLine: Int,
+        maxLines: Int
+    ) -> String {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else {
+            return text
+        }
+
+        var lines: [String] = []
+        var currentLine = ""
+        var wordIndex = 0
+
+        while wordIndex < words.count {
+            let word = String(words[wordIndex])
+            let candidate = currentLine.isEmpty ? word : currentLine + " " + word
+
+            if candidate.count <= maxCharactersPerLine || currentLine.isEmpty {
+                currentLine = candidate
+                wordIndex += 1
+                continue
+            }
+
+            lines.append(currentLine)
+            currentLine = ""
+
+            if lines.count == maxLines {
+                break
+            }
+        }
+
+        if !currentLine.isEmpty && lines.count < maxLines {
+            lines.append(currentLine)
+        }
+
+        let truncated = wordIndex < words.count
+        if truncated, var lastLine = lines.popLast() {
+            let trimmedLimit = max(1, maxCharactersPerLine - 1)
+            if lastLine.count > trimmedLimit {
+                lastLine = String(lastLine.prefix(trimmedLimit))
+            }
+            lines.append(lastLine.trimmingCharacters(in: .whitespacesAndNewlines) + "…")
+        }
+
+        return lines.joined(separator: "\n")
     }
 }
 

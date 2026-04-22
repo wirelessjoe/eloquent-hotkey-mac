@@ -2,12 +2,16 @@ import AVFoundation
 import Foundation
 
 enum SoundEffect {
-    private static let playbackFraction = 0.5
+    private enum PlaybackStyle {
+        case trimmed(maxDuration: TimeInterval)
+        case full
+    }
+
+    private static let playbackFraction = 0.55
     private static let startMaxDuration: TimeInterval = 0.28
-    private static let finishMaxDuration: TimeInterval = 0.22
 
     private static let startSoundURL = loadSoundURL(named: "Glass")
-    private static let finishSoundURL = loadSoundURL(named: "Hero")
+    private static let finishSoundURL = loadSoundURL(named: "Tink")
 
     @MainActor private static var startPlaybackToken = 0
     @MainActor private static var finishPlaybackToken = 0
@@ -19,7 +23,7 @@ enum SoundEffect {
         startPlaybackToken += 1
         play(
             url: startSoundURL,
-            maxDuration: startMaxDuration,
+            playbackStyle: .trimmed(maxDuration: startMaxDuration),
             token: startPlaybackToken,
             setPlayer: { startPlayer = $0 },
             currentToken: { startPlaybackToken }
@@ -31,7 +35,7 @@ enum SoundEffect {
         finishPlaybackToken += 1
         play(
             url: finishSoundURL,
-            maxDuration: finishMaxDuration,
+            playbackStyle: .full,
             token: finishPlaybackToken,
             setPlayer: { finishPlayer = $0 },
             currentToken: { finishPlaybackToken }
@@ -41,7 +45,7 @@ enum SoundEffect {
     @MainActor
     private static func play(
         url: URL?,
-        maxDuration: TimeInterval,
+        playbackStyle: PlaybackStyle,
         token: Int,
         setPlayer: @escaping @MainActor (AVAudioPlayer?) -> Void,
         currentToken: @escaping @MainActor () -> Int
@@ -58,13 +62,22 @@ enum SoundEffect {
             setPlayer(player)
             player.play()
 
-            let stopDelay = max(0.08, min(maxDuration, player.duration * playbackFraction))
+            let stopDelay: TimeInterval
+            switch playbackStyle {
+            case .trimmed(let maxDuration):
+                stopDelay = max(0.08, min(maxDuration, player.duration * playbackFraction))
+            case .full:
+                stopDelay = player.duration + 0.05
+            }
+
             DispatchQueue.main.asyncAfter(deadline: .now() + stopDelay) {
                 guard currentToken() == token else {
                     return
                 }
 
-                player.stop()
+                if case .trimmed = playbackStyle {
+                    player.stop()
+                }
                 setPlayer(nil)
             }
         } catch {
