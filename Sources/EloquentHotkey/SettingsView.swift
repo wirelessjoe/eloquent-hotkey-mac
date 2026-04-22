@@ -102,6 +102,21 @@ struct SettingsView: View {
                     .disabled(model.lastText.isEmpty)
                 }
             }
+
+            Section("About") {
+                HStack {
+                    Text("Version")
+                    Spacer()
+                    Text(AppMetadata.versionString)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Author")
+                    Spacer()
+                    Link(AppMetadata.authorHandle, destination: AppMetadata.authorURL)
+                }
+            }
         }
         .onAppear {
             model.refreshCleanupEngineStatus()

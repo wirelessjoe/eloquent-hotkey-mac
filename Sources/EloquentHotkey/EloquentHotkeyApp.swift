@@ -10,6 +10,7 @@ struct EloquentHotkeyApp: App {
             StatusMenuView(model: model)
         } label: {
             MenuBarLabelView(
+                isArming: model.isArming,
                 isListening: model.isListening,
                 isCleaningUp: model.isCleaningUp
             )
@@ -105,13 +106,14 @@ private enum AppArtwork {
 }
 
 private struct MenuBarLabelView: View {
+    let isArming: Bool
     let isListening: Bool
     let isCleaningUp: Bool
 
     var body: some View {
         Image(
             nsImage: AppArtwork.menuBarTemplateImage(
-                isListening: isListening,
+                isListening: isArming || isListening,
                 isCleaningUp: isCleaningUp
             )
         )
@@ -120,6 +122,10 @@ private struct MenuBarLabelView: View {
     }
 
     private var accessibilityLabel: String {
+        if isArming {
+            return "EloquentHotkey preparing microphone"
+        }
+
         if isListening {
             return "EloquentHotkey listening"
         }
@@ -180,6 +186,10 @@ private struct StatusMenuView: View {
             Label("Cleaning transcript…", systemImage: "sparkles")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        } else if model.isArming {
+            Label("Preparing microphone…", systemImage: "waveform")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
 
         Text(model.statusMessage)
@@ -200,7 +210,7 @@ private struct StatusMenuView: View {
             return "Cleaning Transcript…"
         }
 
-        return model.isListening ? "Stop Dictation" : "Start Dictation"
+        return model.isArming || model.isListening ? "Stop Dictation" : "Start Dictation"
     }
 
     private var wrappedTranscriptPreview: String {

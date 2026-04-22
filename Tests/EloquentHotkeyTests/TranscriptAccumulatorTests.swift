@@ -118,6 +118,92 @@ final class TranscriptAccumulatorTests: XCTestCase {
         XCTAssertFalse(update.recognizerTranscriptShrank)
     }
 
+    func testRejectsWrappedDuplicatePrefixFromPreviousTranscript() {
+        var accumulator = TranscriptAccumulator()
+
+        _ = accumulator.ingest(
+            formattedTranscript: "Of course good morning guys what's next in this process we executed the docs from Morgan Stanley last Friday as well as yours of course",
+            segments: [
+                segment(0.00, "of"),
+                segment(0.20, "course"),
+                segment(0.40, "good"),
+                segment(0.60, "morning"),
+                segment(0.80, "guys"),
+            ]
+        )
+
+        let update = accumulator.ingest(
+            formattedTranscript: "Good morning guys what's next in this process we executed the docs from Morgan Stanley last Friday as well as yours of course",
+            segments: [
+                segment(0.00, "good"),
+                segment(0.20, "morning"),
+                segment(0.40, "guys"),
+                segment(0.60, "what's"),
+                segment(0.80, "next"),
+            ]
+        )
+
+        XCTAssertEqual(
+            update.transcript,
+            "Good morning guys what's next in this process we executed the docs from Morgan Stanley last Friday as well as yours of course"
+        )
+        XCTAssertFalse(update.recognizerTranscriptShrank)
+    }
+
+    func testKeepsEarlierFullCoverageWhenFinalSnapshotStartsLate() {
+        var accumulator = TranscriptAccumulator()
+
+        _ = accumulator.ingest(
+            formattedTranscript: "Good morning guys what's the next step in the process we executed Morgan Stanley docs on Friday and of course yours before that thanks",
+            segments: [
+                segment(0.00, "good"),
+                segment(0.24, "morning"),
+                segment(0.48, "guys"),
+                segment(0.72, "what's"),
+                segment(0.96, "the"),
+                segment(1.20, "next"),
+                segment(1.44, "step"),
+                segment(1.68, "in"),
+                segment(1.92, "the"),
+                segment(2.16, "process"),
+                segment(2.40, "we"),
+                segment(2.64, "executed"),
+                segment(2.88, "Morgan"),
+                segment(3.12, "Stanley"),
+                segment(3.36, "docs"),
+                segment(3.60, "on"),
+                segment(3.84, "Friday"),
+                segment(4.08, "and"),
+                segment(4.32, "of"),
+                segment(4.56, "course"),
+                segment(4.80, "yours"),
+                segment(5.04, "before"),
+                segment(5.28, "that"),
+                segment(5.52, "thanks"),
+            ]
+        )
+
+        let update = accumulator.ingest(
+            formattedTranscript: "We of course did yours before that thanks",
+            segments: [
+                segment(10.44, "we"),
+                segment(10.68, "of"),
+                segment(10.92, "course"),
+                segment(11.16, "did"),
+                segment(11.40, "yours"),
+                segment(11.64, "before"),
+                segment(11.88, "that"),
+                segment(12.12, "thanks"),
+            ]
+        )
+
+        XCTAssertEqual(
+            update.transcript,
+            "Good morning guys what's the next step in the process we executed Morgan Stanley docs on Friday and of course yours before that thanks"
+        )
+        XCTAssertTrue(update.recognizerTranscriptShrank)
+    }
+
     private func segment(_ timestamp: TimeInterval, _ text: String) -> TranscriptAccumulator.Segment {
         .init(timestamp: timestamp, duration: 0.18, text: text)
     }
