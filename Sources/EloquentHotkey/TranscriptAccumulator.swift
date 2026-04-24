@@ -24,6 +24,7 @@ struct TranscriptAccumulator {
     }
 
     private var bestSnapshot: Snapshot?
+    private var earliestObservedStart: TimeInterval?
 
     mutating func ingest(formattedTranscript: String, segments: [Segment]) -> Update {
         let currentTranscript = formattedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -38,6 +39,8 @@ struct TranscriptAccumulator {
             transcript: currentTranscript,
             segments: segments
         )
+        let anchorStart = min(earliestObservedStart ?? currentSnapshot.firstSegmentStart, currentSnapshot.firstSegmentStart)
+        earliestObservedStart = anchorStart
 
         guard let bestSnapshot else {
             self.bestSnapshot = currentSnapshot
@@ -47,7 +50,11 @@ struct TranscriptAccumulator {
             )
         }
 
-        if shouldReplaceBest(previous: bestSnapshot, current: currentSnapshot) {
+        if shouldReplaceBest(
+            previous: bestSnapshot,
+            current: currentSnapshot,
+            anchorStart: anchorStart
+        ) {
             self.bestSnapshot = currentSnapshot
             return Update(
                 transcript: currentSnapshot.transcript,
@@ -75,13 +82,24 @@ struct TranscriptAccumulator {
         )
     }
 
-    private func shouldReplaceBest(previous: Snapshot, current: Snapshot) -> Bool {
+    private func shouldReplaceBest(
+        previous: Snapshot,
+        current: Snapshot,
+        anchorStart: TimeInterval
+    ) -> Bool {
         guard !current.words.isEmpty else {
             return false
         }
 
         if isLikelyWrappedDuplicate(previous: previous.words, current: current.words) {
             return true
+        }
+
+        let currentPreservesOpening = current.firstSegmentStart <= anchorStart + 1.0
+        let previousPreservesOpening = previous.firstSegmentStart <= anchorStart + 1.0
+
+        if previousPreservesOpening != currentPreservesOpening {
+            return currentPreservesOpening
         }
 
         if isClearRegression(previous: previous, current: current) {
@@ -98,9 +116,9 @@ struct TranscriptAccumulator {
             reference: previous.words,
             candidate: current.words
         )
-        let timingSimilar = abs(startDelta) <= 0.35 && abs(endDelta) <= 0.5
+        let coverageStable = abs(startDelta) <= 0.1 && abs(endDelta) <= 0.35
 
-        if timingSimilar && current.transcript != previous.transcript {
+        if coverageStable && current.transcript != previous.transcript {
             return true
         }
 
@@ -110,6 +128,12 @@ struct TranscriptAccumulator {
 
         if endDelta > 0.6 && current.firstSegmentStart <= previous.firstSegmentStart + 0.75 {
             return true
+        }
+
+        // Do not let the best snapshot drift forward a few hundred milliseconds at a time
+        // unless the recognizer also extends the captured tail in a meaningful way.
+        if startDelta > 0.15 && endDelta < 0.5 {
+            return false
         }
 
         if current.score > previous.score,
@@ -139,6 +163,13 @@ struct TranscriptAccumulator {
             reference: current.words,
             candidate: previous.words
         )
+
+        if startDelta >= 0.25,
+           wordLoss >= 1,
+           currentRetentionInPrevious >= 0.9,
+           endDelta <= 0.35 {
+            return true
+        }
 
         if startDelta >= 0.75,
            wordLoss >= 2,
