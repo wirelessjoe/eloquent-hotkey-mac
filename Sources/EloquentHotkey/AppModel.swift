@@ -78,6 +78,8 @@ final class AppModel: ObservableObject {
     private var dictationTask: Task<Void, Never>?
     private var workspaceObserver: NSObjectProtocol?
     private var lastExternalApplication: NSRunningApplication?
+    private var didPlayStartRecordingSound = false
+    private var didPlayFinishRecordingSound = false
 
     init() {
         self.lastText = defaults.string(forKey: Defaults.lastText) ?? ""
@@ -234,6 +236,8 @@ final class AppModel: ObservableObject {
         isArming = true
         isListening = false
         isCleaningUp = false
+        didPlayStartRecordingSound = false
+        didPlayFinishRecordingSound = false
         logger.notice("Starting dictation via \(trigger.logName, privacy: .public)")
 
         let targetApplication = currentTargetApplication()
@@ -253,6 +257,7 @@ final class AppModel: ObservableObject {
                 self.isArming = false
                 self.isListening = true
                 self.statusMessage = "Listening with \(self.selectedMicrophoneName)…"
+                self.didPlayStartRecordingSound = true
                 SoundEffect.playStartRecording()
             }
         )
@@ -292,10 +297,12 @@ final class AppModel: ObservableObject {
 
         statusMessage = "Finishing dictation…"
         logger.notice("Stop requested from UI or key release")
+        playFinishRecordingSoundIfNeeded()
         activeDictation?.requestStop()
     }
 
     private func beginCleanupPhase() {
+        playFinishRecordingSoundIfNeeded()
         isArming = false
         isListening = false
         isCleaningUp = true
@@ -311,7 +318,7 @@ final class AppModel: ObservableObject {
         isArming = false
         isListening = false
         isCleaningUp = false
-        SoundEffect.playFinishRecording()
+        playFinishRecordingSoundIfNeeded()
 
         guard !cleaned.isEmpty else {
             statusMessage = "No text was captured."
@@ -352,8 +359,17 @@ final class AppModel: ObservableObject {
         isArming = false
         isListening = false
         isCleaningUp = false
-        SoundEffect.playFinishRecording()
+        playFinishRecordingSoundIfNeeded()
         statusMessage = error.localizedDescription
+    }
+
+    private func playFinishRecordingSoundIfNeeded() {
+        guard didPlayStartRecordingSound, !didPlayFinishRecordingSound else {
+            return
+        }
+
+        didPlayFinishRecordingSound = true
+        SoundEffect.playFinishRecording()
     }
 
     private func observeActiveApplications() {

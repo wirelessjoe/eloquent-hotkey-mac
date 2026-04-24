@@ -41,6 +41,18 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
     private var bufferedStartupAudio: [AVAudioPCMBuffer] = []
     private var bufferedStartupAudioDuration: TimeInterval = 0
     private var didLogFirstTranscript = false
+    private var earliestObservedResultStart: TimeInterval?
+    private var recordingFileURL: URL?
+    private var recordingFile: AVAudioFile?
+    private var recordedAudioDuration: TimeInterval = 0
+
+    private struct RecordedAudioFallbackDecision {
+        let reason: String
+        let audioDuration: TimeInterval
+        let finalCoverage: TimeInterval
+        let wordsPerSecond: Double
+        let charactersPerSecond: Double
+    }
 
     init(
         configuration: DictationConfiguration,
@@ -137,6 +149,10 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             self.bufferedStartupAudio.removeAll(keepingCapacity: true)
             self.bufferedStartupAudioDuration = 0
             self.didLogFirstTranscript = false
+            self.earliestObservedResultStart = nil
+            self.recordingFile = nil
+            self.recordingFileURL = nil
+            self.recordedAudioDuration = 0
 
             self.recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
                 guard let self else {
@@ -177,8 +193,17 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
 
     private func handleRecognition(result: SFSpeechRecognitionResult?, error: Error?) {
         if let result {
+            let currentTranscript = result.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+            let currentFirstSegmentStart = result.bestTranscription.segments.first?.timestamp ?? 0
+            if !result.bestTranscription.segments.isEmpty {
+                earliestObservedResultStart = min(
+                    earliestObservedResultStart ?? currentFirstSegmentStart,
+                    currentFirstSegmentStart
+                )
+            }
+
             let update = transcriptAccumulator.ingest(
-                formattedTranscript: result.bestTranscription.formattedString,
+                formattedTranscript: currentTranscript,
                 segments: result.bestTranscription.segments.map { segment in
                     TranscriptAccumulator.Segment(
                         timestamp: segment.timestamp,
@@ -195,6 +220,12 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
                     sawSpeech = true
                     lastTranscriptChangeAt = Date()
                     logFirstTranscriptIfNeeded(for: result, transcript: transcript)
+                    logTranscriptUpdate(
+                        for: result,
+                        currentTranscript: currentTranscript,
+                        chosenTranscript: transcript,
+                        recognizerTranscriptShrank: update.recognizerTranscriptShrank
+                    )
                 }
             }
 
@@ -204,7 +235,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
 
             if result.isFinal {
                 logFinalTranscript(result, transcript: transcript)
-                finishWithCurrentTranscript()
+                finishAfterFinalResult(result, liveTranscript: transcript)
                 return
             }
         }
@@ -289,7 +320,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         }
 
         isFinishing = true
-        Self.logger.debug("Dictation finished successfully with \(value.count, privacy: .public) characters")
+        Self.logger.notice("Dictation finished successfully with \(value.count, privacy: .public) characters")
         tearDown()
         continuation?.resume(returning: value)
         continuation = nil
@@ -308,6 +339,11 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
     }
 
     private func tearDown() {
+        stopStreamingRecognition()
+        cleanupRecordedAudioArtifacts()
+    }
+
+    private func stopStreamingRecognition() {
         timer?.cancel()
         timer = nil
 
@@ -323,12 +359,24 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         recognitionTask?.cancel()
         recognitionTask = nil
 
+        recordingFile = nil
+
         stopRequestedAt = nil
         audioCaptureEnded = false
         bufferedStartupAudio.removeAll(keepingCapacity: false)
         bufferedStartupAudioDuration = 0
         didSignalReady = false
         didLogFirstTranscript = false
+        earliestObservedResultStart = nil
+        recordedAudioDuration = 0
+    }
+
+    private func cleanupRecordedAudioArtifacts() {
+        recordingFile = nil
+        if let recordingFileURL {
+            try? FileManager.default.removeItem(at: recordingFileURL)
+        }
+        recordingFileURL = nil
     }
 
     private func endAudioCaptureIfNeeded() {
@@ -351,8 +399,14 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             return
         }
 
-        if let boostedBuffer = recognitionBuffer(from: sampleBuffer) {
-            appendAudioForRecognition(boostedBuffer, into: request)
+        if let pcmBuffer = pcmBuffer(from: sampleBuffer) {
+            if let gain = applyAdaptiveGain(to: pcmBuffer), !loggedQuietInputBoost {
+                loggedQuietInputBoost = true
+                Self.logger.notice("Boosted quiet microphone input by \(gain, privacy: .public)x for speech recognition")
+            }
+
+            appendAudioForRecognition(pcmBuffer, into: request)
+            appendRecordedAudio(pcmBuffer)
         } else {
             if !didSignalReady {
                 signalReadyIfNeeded(
@@ -425,7 +479,7 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         }
     }
 
-    private func recognitionBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+    private func pcmBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription),
               let audioFormat = AVAudioFormat(streamDescription: streamDescription)
@@ -452,12 +506,30 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
             return nil
         }
 
-        if let gain = applyAdaptiveGain(to: pcmBuffer), !loggedQuietInputBoost {
-            loggedQuietInputBoost = true
-            Self.logger.notice("Boosted quiet microphone input by \(gain, privacy: .public)x for speech recognition")
-        }
-
         return pcmBuffer
+    }
+
+    private func appendRecordedAudio(_ buffer: AVAudioPCMBuffer) {
+        do {
+            if recordingFile == nil {
+                let recordingURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("EloquentHotkey-\(UUID().uuidString)")
+                    .appendingPathExtension("caf")
+                recordingFileURL = recordingURL
+                recordingFile = try AVAudioFile(
+                    forWriting: recordingURL,
+                    settings: buffer.format.settings,
+                    commonFormat: buffer.format.commonFormat,
+                    interleaved: buffer.format.isInterleaved
+                )
+            }
+
+            try recordingFile?.write(from: buffer)
+            recordedAudioDuration += duration(of: buffer)
+        } catch {
+            Self.logger.error("Could not record dictation audio for fallback recognition: \(error.localizedDescription, privacy: .public)")
+            cleanupRecordedAudioArtifacts()
+        }
     }
 
     private func applyAdaptiveGain(to buffer: AVAudioPCMBuffer) -> Float? {
@@ -559,11 +631,246 @@ final class DictationController: NSObject, @unchecked Sendable, AVCaptureAudioDa
         )
     }
 
+    private func logTranscriptUpdate(
+        for result: SFSpeechRecognitionResult,
+        currentTranscript: String,
+        chosenTranscript: String,
+        recognizerTranscriptShrank: Bool
+    ) {
+        let firstSegmentTimestamp = result.bestTranscription.segments.first?.timestamp ?? 0
+        let lastSegmentEnd = result.bestTranscription.segments.last.map { $0.timestamp + $0.duration } ?? 0
+        Self.logger.notice(
+            "Transcript update currentChars=\(currentTranscript.count, privacy: .public) chosenChars=\(chosenTranscript.count, privacy: .public) firstSegment=\(firstSegmentTimestamp, privacy: .public) lastSegmentEnd=\(lastSegmentEnd, privacy: .public) shrank=\(recognizerTranscriptShrank, privacy: .public)"
+        )
+    }
+
+    private func finishAfterFinalResult(
+        _ result: SFSpeechRecognitionResult,
+        liveTranscript: String
+    ) {
+        let cleanedLiveTranscript = liveTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedLiveTranscript.isEmpty else {
+            finish(error: AppError.emptyTranscript)
+            return
+        }
+
+        guard let fallbackDecision = recordedAudioFallbackDecision(for: result, liveTranscript: cleanedLiveTranscript),
+              let recordingFileURL
+        else {
+            finish(value: cleanedLiveTranscript)
+            return
+        }
+
+        let finalStart = result.bestTranscription.segments.first?.timestamp ?? 0
+        let earliestStart = earliestObservedResultStart ?? finalStart
+        Self.logger.notice(
+            "Live transcript looks incomplete (reason=\(fallbackDecision.reason, privacy: .public), earliestStart=\(earliestStart, privacy: .public)s, finalStart=\(finalStart, privacy: .public)s, finalCoverage=\(fallbackDecision.finalCoverage, privacy: .public)s, audioDuration=\(fallbackDecision.audioDuration, privacy: .public)s, wordsPerSecond=\(fallbackDecision.wordsPerSecond, privacy: .public), charactersPerSecond=\(fallbackDecision.charactersPerSecond, privacy: .public)). Retrying recognition on the recorded audio."
+        )
+
+        stopStreamingRecognition()
+
+        Task { [weak self, recordingFileURL] in
+            do {
+                let fallbackResult = try await Self.transcribeRecordedAudio(at: recordingFileURL)
+                let fallbackTranscript = fallbackResult.bestTranscription.formattedString.trimmingCharacters(in: .whitespacesAndNewlines)
+                let fallbackStart = fallbackResult.bestTranscription.segments.first?.timestamp ?? 0
+                let liveWords = Self.normalizedWords(in: cleanedLiveTranscript)
+                let fallbackWords = Self.normalizedWords(in: fallbackTranscript)
+                let liveRetentionInFallback = Self.orderedWordRetention(reference: liveWords, candidate: fallbackWords)
+                let chosenTranscript = Self.preferredTranscript(
+                    liveTranscript: cleanedLiveTranscript,
+                    liveStart: finalStart,
+                    fallbackTranscript: fallbackTranscript,
+                    fallbackStart: fallbackStart
+                )
+
+                Self.logger.notice(
+                    "Recorded-audio fallback result liveChars=\(cleanedLiveTranscript.count, privacy: .public), fallbackChars=\(fallbackTranscript.count, privacy: .public), liveWords=\(liveWords.count, privacy: .public), fallbackWords=\(fallbackWords.count, privacy: .public), retention=\(liveRetentionInFallback, privacy: .public), fallbackStart=\(fallbackStart, privacy: .public)s"
+                )
+
+                if chosenTranscript != cleanedLiveTranscript {
+                    Self.logger.notice(
+                        "Recorded-audio fallback recovered a fuller transcript (liveChars=\(cleanedLiveTranscript.count, privacy: .public), fallbackChars=\(fallbackTranscript.count, privacy: .public))"
+                    )
+                } else {
+                    Self.logger.notice("Recorded-audio fallback did not improve the live transcript")
+                }
+
+                self?.engineQueue.async { [weak self] in
+                    self?.finish(value: chosenTranscript)
+                }
+            } catch {
+                Self.logger.error("Recorded-audio fallback failed: \(error.localizedDescription, privacy: .public)")
+                self?.engineQueue.async { [weak self] in
+                    self?.finish(value: cleanedLiveTranscript)
+                }
+            }
+        }
+    }
+
+    private func recordedAudioFallbackDecision(
+        for result: SFSpeechRecognitionResult,
+        liveTranscript: String
+    ) -> RecordedAudioFallbackDecision? {
+        let finalStart = result.bestTranscription.segments.first?.timestamp ?? 0
+        let finalEnd = result.bestTranscription.segments.last.map { $0.timestamp + $0.duration } ?? finalStart
+        let finalCoverage = max(0, finalEnd - finalStart)
+        let earliestStart = earliestObservedResultStart ?? finalStart
+        let liveWordCount = Self.normalizedWords(in: liveTranscript).count
+        let elapsedSinceStart = Date().timeIntervalSince(startedAt)
+        let audioDuration = max(recordedAudioDuration, elapsedSinceStart)
+        let wordsPerSecond = Double(liveWordCount) / max(audioDuration, 1)
+        let charactersPerSecond = Double(liveTranscript.count) / max(audioDuration, 1)
+
+        func decision(_ reason: String) -> RecordedAudioFallbackDecision {
+            RecordedAudioFallbackDecision(
+                reason: reason,
+                audioDuration: audioDuration,
+                finalCoverage: finalCoverage,
+                wordsPerSecond: wordsPerSecond,
+                charactersPerSecond: charactersPerSecond
+            )
+        }
+
+        if finalStart - earliestStart >= 1.0 {
+            return decision("final result shifted later than earlier partials")
+        }
+
+        if audioDuration >= 8.0 && liveWordCount <= 3 {
+            return decision("long recording produced almost no words")
+        }
+
+        if audioDuration >= 10.0 && (wordsPerSecond < 0.9 || charactersPerSecond < 4.5) {
+            return decision("long recording produced unusually sparse text")
+        }
+
+        if audioDuration >= 8.0 && finalCoverage > 0 && finalCoverage / audioDuration < 0.55 {
+            return decision("recognized segment coverage is much shorter than captured audio")
+        }
+
+        if audioDuration >= 8.0 && finalCoverage <= 0.25 && liveWordCount >= 6 {
+            return decision("recognizer returned unreliable segment coverage for a long recording")
+        }
+
+        return nil
+    }
+
+    private static func transcribeRecordedAudio(at url: URL) async throws -> SFSpeechRecognitionResult {
+        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")),
+              recognizer.isAvailable
+        else {
+            throw AppError.recognizerUnavailable
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let request = SFSpeechURLRecognitionRequest(url: url)
+            request.shouldReportPartialResults = false
+            request.contextualStrings = CodingLexicon.contextualPhrases
+            request.taskHint = .dictation
+            if #available(macOS 13, *) {
+                request.addsPunctuation = true
+            }
+            // The live on-device recognizer can occasionally return only a sparse
+            // partial for longer dictations, so the rescue pass allows Apple's
+            // recognizer to choose the best available path for the saved audio.
+
+            var task: SFSpeechRecognitionTask?
+            task = recognizer.recognitionTask(with: request) { result, error in
+                if let result, result.isFinal {
+                    task?.cancel()
+                    continuation.resume(returning: result)
+                    return
+                }
+
+                if let error {
+                    task?.cancel()
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private static func preferredTranscript(
+        liveTranscript: String,
+        liveStart: TimeInterval,
+        fallbackTranscript: String,
+        fallbackStart: TimeInterval
+    ) -> String {
+        let cleanedFallback = fallbackTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedFallback.isEmpty else {
+            return liveTranscript
+        }
+
+        let liveWords = normalizedWords(in: liveTranscript)
+        let fallbackWords = normalizedWords(in: cleanedFallback)
+        let liveRetentionInFallback = orderedWordRetention(reference: liveWords, candidate: fallbackWords)
+        let liveScore = transcriptScore(liveTranscript)
+        let fallbackScore = transcriptScore(cleanedFallback)
+        let fallbackAddsSubstantialContent = fallbackWords.count >= liveWords.count + 4
+            || cleanedFallback.count >= liveTranscript.count + 24
+
+        if fallbackStart + 1.0 < liveStart,
+           fallbackScore >= liveScore,
+           liveRetentionInFallback >= 0.5 {
+            return cleanedFallback
+        }
+
+        if liveWords.count <= 3,
+           fallbackWords.count >= liveWords.count + 3 {
+            return cleanedFallback
+        }
+
+        if fallbackAddsSubstantialContent,
+           liveRetentionInFallback >= 0.55 {
+            return cleanedFallback
+        }
+
+        if fallbackScore > liveScore,
+           liveRetentionInFallback >= 0.65 {
+            return cleanedFallback
+        }
+
+        return liveTranscript
+    }
+
     private func duration(of buffer: AVAudioPCMBuffer) -> TimeInterval {
         guard buffer.format.sampleRate > 0 else {
             return 0
         }
 
         return Double(buffer.frameLength) / buffer.format.sampleRate
+    }
+
+    private static func transcriptScore(_ transcript: String) -> Int {
+        (normalizedWords(in: transcript).count * 1_000) + transcript.count
+    }
+
+    private static func normalizedWords(in text: String) -> [String] {
+        text.lowercased().split(whereSeparator: { character in
+            !(character.isLetter || character.isNumber || character == "/" || character == "_" || character == "-")
+        }).map(String.init)
+    }
+
+    private static func orderedWordRetention(reference: [String], candidate: [String]) -> Double {
+        guard !reference.isEmpty else {
+            return 1
+        }
+
+        var candidateIndex = 0
+        var matches = 0
+
+        for word in reference {
+            while candidateIndex < candidate.count {
+                if candidate[candidateIndex] == word {
+                    matches += 1
+                    candidateIndex += 1
+                    break
+                }
+
+                candidateIndex += 1
+            }
+        }
+
+        return Double(matches) / Double(reference.count)
     }
 }

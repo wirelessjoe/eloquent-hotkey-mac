@@ -1,17 +1,21 @@
 import AVFoundation
 import Foundation
+import OSLog
 
 enum SoundEffect {
     private enum PlaybackStyle {
-        case trimmed(maxDuration: TimeInterval)
+        case trimmed(maxDuration: TimeInterval, fadeOutDuration: TimeInterval)
         case full
     }
 
     private static let playbackFraction = 0.55
     private static let startMaxDuration: TimeInterval = 0.28
+    private static let finishMaxDuration: TimeInterval = 0.42
+    private static let fadeOutDuration: TimeInterval = 0.10
 
     private static let startSoundURL = loadSoundURL(named: "Glass")
-    private static let finishSoundURL = loadSoundURL(named: "Tink")
+    private static let finishSoundURL = loadSoundURL(named: "Hero")
+    private static let logger = Logger(subsystem: "dev.codex.EloquentHotkey", category: "SoundEffect")
 
     @MainActor private static var startPlaybackToken = 0
     @MainActor private static var finishPlaybackToken = 0
@@ -22,8 +26,9 @@ enum SoundEffect {
     static func playStartRecording() {
         startPlaybackToken += 1
         play(
+            name: "start",
             url: startSoundURL,
-            playbackStyle: .trimmed(maxDuration: startMaxDuration),
+            playbackStyle: .trimmed(maxDuration: startMaxDuration, fadeOutDuration: fadeOutDuration),
             token: startPlaybackToken,
             setPlayer: { startPlayer = $0 },
             currentToken: { startPlaybackToken }
@@ -34,8 +39,9 @@ enum SoundEffect {
     static func playFinishRecording() {
         finishPlaybackToken += 1
         play(
+            name: "finish",
             url: finishSoundURL,
-            playbackStyle: .full,
+            playbackStyle: .trimmed(maxDuration: finishMaxDuration, fadeOutDuration: fadeOutDuration),
             token: finishPlaybackToken,
             setPlayer: { finishPlayer = $0 },
             currentToken: { finishPlaybackToken }
@@ -44,6 +50,7 @@ enum SoundEffect {
 
     @MainActor
     private static func play(
+        name: String,
         url: URL?,
         playbackStyle: PlaybackStyle,
         token: Int,
@@ -51,23 +58,38 @@ enum SoundEffect {
         currentToken: @escaping @MainActor () -> Int
     ) {
         guard let url else {
+            logger.error("Could not play \(name, privacy: .public) sound because no sound file was found")
             return
         }
 
         do {
             let player = try AVAudioPlayer(contentsOf: url)
-            player.volume = 0.7
+            player.volume = name == "finish" ? 0.95 : 0.7
             player.prepareToPlay()
 
             setPlayer(player)
             player.play()
+            logger.notice("Playing \(name, privacy: .public) sound from \(url.lastPathComponent, privacy: .public)")
 
             let stopDelay: TimeInterval
+            let fadeOutDuration: TimeInterval
             switch playbackStyle {
-            case .trimmed(let maxDuration):
+            case .trimmed(let maxDuration, let duration):
                 stopDelay = max(0.08, min(maxDuration, player.duration * playbackFraction))
+                fadeOutDuration = min(duration, max(stopDelay / 2, 0.02))
             case .full:
                 stopDelay = player.duration + 0.05
+                fadeOutDuration = 0
+            }
+
+            if fadeOutDuration > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(0, stopDelay - fadeOutDuration)) {
+                    guard currentToken() == token else {
+                        return
+                    }
+
+                    player.setVolume(0, fadeDuration: fadeOutDuration)
+                }
             }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + stopDelay) {
@@ -81,6 +103,7 @@ enum SoundEffect {
                 setPlayer(nil)
             }
         } catch {
+            logger.error("Could not play \(name, privacy: .public) sound: \(error.localizedDescription, privacy: .public)")
             setPlayer(nil)
         }
     }

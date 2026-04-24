@@ -1,8 +1,8 @@
 import Foundation
 
 enum AppMetadata {
-    private static let fallbackVersion = "0.1.2"
-    private static let fallbackBuild = "2"
+    private static let fallbackVersion = "0.1.3"
+    private static let fallbackBuild = "4"
 
     static let authorHandle = "@wirelessjoe"
     static let authorURL = URL(string: "https://twitter.com/wirelessjoe")!
