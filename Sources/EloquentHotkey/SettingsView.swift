@@ -120,6 +120,7 @@ struct SettingsView: View {
         }
         .onAppear {
             model.refreshCleanupEngineStatus()
+            model.refreshIntegrationAccess()
         }
     }
 }

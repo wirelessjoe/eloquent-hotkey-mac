@@ -231,21 +231,26 @@ final class GlobalHotkeyManager {
     }
 
     private func installEventTapIfNeeded() -> Bool {
-        if let eventTap {
+        if let eventTap, CFMachPortIsValid(eventTap) {
             CGEvent.tapEnable(tap: eventTap, enable: true)
-            return true
+            return CGEvent.tapIsEnabled(tap: eventTap)
         }
 
-        guard PermissionManager.hasListenEventAccess() else {
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+            self.runLoopSource = nil
+        }
+        eventTap = nil
+
+        // A filtering tap needs event-posting access as well as keyboard access.
+        guard PermissionManager.hasListenEventAccess(), PermissionManager.hasPostEventAccess() else {
             return false
         }
 
         let eventMask =
             (1 << CGEventType.keyDown.rawValue) |
             (1 << CGEventType.keyUp.rawValue) |
-            (1 << CGEventType.flagsChanged.rawValue) |
-            (1 << CGEventType.tapDisabledByTimeout.rawValue) |
-            (1 << CGEventType.tapDisabledByUserInput.rawValue)
+            (1 << CGEventType.flagsChanged.rawValue)
 
         guard let eventTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -301,13 +306,11 @@ final class GlobalHotkeyManager {
             return nil
         }
 
-        if shortcut.matchesRelease(eventType: type, keyCode: keyCode, modifiers: modifiers) {
-            if isShortcutPressed {
-                isShortcutPressed = false
-                let handler = onRelease
-                DispatchQueue.main.async {
-                    handler?()
-                }
+        if isShortcutPressed, shortcut.matchesRelease(eventType: type, keyCode: keyCode, modifiers: modifiers) {
+            isShortcutPressed = false
+            let handler = onRelease
+            DispatchQueue.main.async {
+                handler?()
             }
             return nil
         }

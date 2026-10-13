@@ -6,7 +6,18 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$ROOT_DIR/dist/EloquentHotkey.app"
 RESOURCE_DIR="$ROOT_DIR/Resources"
 
-SIGNING_IDENTITY="${CODE_SIGN_IDENTITY:-}"
+if ps -axo comm= | awk -v executable="$APP_DIR/Contents/MacOS/EloquentHotkey" '$0 == executable { found = 1 } END { exit !found }'; then
+  print -u2 "Quit EloquentHotkey before rebuilding so macOS can verify the running app's signature."
+  exit 1
+fi
+
+source "$ROOT_DIR/scripts/signing-identity.sh"
+PREVIOUS_IDENTITY=""
+if [[ -d "$APP_DIR" ]]; then
+  PREVIOUS_IDENTITY="$(codesign -d --verbose=2 "$APP_DIR" 2>&1 | sed -n 's/^Authority=//p' | head -n 1)"
+fi
+AVAILABLE_IDENTITIES="$(security find-identity -vp codesigning 2>/dev/null || true)"
+SIGNING_IDENTITY="$(select_signing_identity "${CODE_SIGN_IDENTITY:-}" "$PREVIOUS_IDENTITY" "$AVAILABLE_IDENTITIES")"
 
 cd "$ROOT_DIR"
 swift build -c release --jobs 1
@@ -51,15 +62,7 @@ fi
 
 chmod +x "$APP_DIR/Contents/MacOS/EloquentHotkey"
 
-if [[ -z "$SIGNING_IDENTITY" ]]; then
-  SIGNING_IDENTITY="$(
-    security find-identity -vp codesigning 2>/dev/null |
-      sed -n 's/.*"\(.*\)"/\1/p' |
-      head -n 1
-  )"
-fi
-
-if [[ -n "$SIGNING_IDENTITY" ]]; then
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
   codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP_DIR" >/dev/null
   echo "Signed with $SIGNING_IDENTITY"
 else
