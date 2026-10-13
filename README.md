@@ -57,6 +57,8 @@ If auto-paste misses, the cleaned result is still saved in the app and available
 
 The Settings window shows which cleanup engine is active on the current Mac.
 
+Short phrases use the instant local pass directly to avoid waiting on model generation. Longer dictations can receive Apple cleanup, with checks that preserve negations and numbers and reject excessive rewrites. If a full model response would not fit, the app uses the local result immediately.
+
 ## Permissions
 
 Depending on how you use the app, macOS may ask for:
@@ -102,7 +104,7 @@ That produces:
 /Volumes/External/local-code-e/eloquent-hotkey-mac/dist/EloquentHotkey.app
 ```
 
-The build script copies bundled resources, generates the app icon, and signs the app. If a stable local signing identity is available, it uses that automatically so macOS permissions survive rebuilds much more reliably.
+Quit the running app before rebuilding. The build script copies bundled resources, generates the app icon, and preserves the existing app's signing certificate so macOS permissions survive rebuilds. If that certificate is unavailable, the build stops. Set `CODE_SIGN_IDENTITY` explicitly to select a different certificate; macOS permissions then need to be renewed. New installations select an available local signing identity.
 
 ## Development
 
@@ -110,6 +112,7 @@ Run tests with:
 
 ```bash
 swift test
+zsh scripts/tests/signing-identity-tests.sh
 ```
 
 If you want to run the built binary directly during development:

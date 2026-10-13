@@ -138,6 +138,15 @@ final class AppModel: ObservableObject {
         cleanupEngineStatus = TranscriptCleaner.currentStatus()
     }
 
+    func refreshIntegrationAccess() {
+        if !hotkeyRegistrationSucceeded {
+            registerHotkey()
+            if hotkeyRegistrationSucceeded {
+                statusMessage = "Hold \(hotkey.displayString) to dictate."
+            }
+        }
+    }
+
     func updateHotkey(_ newHotkey: Shortcut) {
         if !PermissionManager.hasListenEventAccess() {
             _ = ensureListenEventAccess(promptIfNeeded: true)
@@ -195,10 +204,12 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let text = lastText
+        let targetApplication = currentTargetApplication()
         Task {
             let pasted = await AutoPasteController.paste(
-                lastText,
-                into: currentTargetApplication()
+                text,
+                into: targetApplication
             )
 
             await MainActor.run {
@@ -241,6 +252,7 @@ final class AppModel: ObservableObject {
         logger.notice("Starting dictation via \(trigger.logName, privacy: .public)")
 
         let targetApplication = currentTargetApplication()
+        logger.notice("Dictation target: \(targetApplication?.bundleIdentifier ?? "none", privacy: .public)")
         let config = DictationConfiguration(
             microphoneID: selectedMicrophoneID == AudioDeviceManager.systemDefaultID ? nil : selectedMicrophoneID,
             silenceTimeout: silenceTimeout,
@@ -327,6 +339,7 @@ final class AppModel: ObservableObject {
 
         lastText = cleaned
         defaults.set(cleaned, forKey: Defaults.lastText)
+        logger.notice("Transcript ready: chars=\(cleaned.count), autoPaste=\(self.autoPasteEnabled)")
 
         if autoPasteEnabled {
             guard ensurePostEventAccess(promptIfNeeded: true) else {
@@ -379,13 +392,15 @@ final class AppModel: ObservableObject {
             queue: .main
         ) { [weak self] notification in
             guard let self,
-                  let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  application.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+                  let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
                 return
             }
 
             Task { @MainActor in
-                self.lastExternalApplication = application
+                self.refreshIntegrationAccess()
+                if application.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                    self.lastExternalApplication = application
+                }
             }
         }
     }
@@ -405,10 +420,15 @@ final class AppModel: ObservableObject {
 
     private func registerHotkey() {
         hotkeyRegistrationSucceeded = hotkeyManager.register(shortcut: hotkey)
+        logger.notice("Shortcut registration: success=\(self.hotkeyRegistrationSucceeded), inputMonitoring=\(PermissionManager.hasListenEventAccess()), eventPosting=\(PermissionManager.hasPostEventAccess())")
         if !hotkeyRegistrationSucceeded {
-            statusMessage = PermissionManager.hasListenEventAccess()
-                ? "Could not activate \(hotkey.displayString) as the global hold-to-talk shortcut."
-                : "Allow EloquentHotkey to monitor your keyboard to use the global hold-to-talk shortcut."
+            if !PermissionManager.hasPostEventAccess() {
+                statusMessage = "Enable Accessibility for EloquentHotkey in System Settings to use the shortcut and auto-paste."
+            } else if !PermissionManager.hasListenEventAccess() {
+                statusMessage = "Enable Input Monitoring for EloquentHotkey in System Settings to use the global shortcut."
+            } else {
+                statusMessage = "Could not activate \(hotkey.displayString) as the global hold-to-talk shortcut."
+            }
         }
     }
 

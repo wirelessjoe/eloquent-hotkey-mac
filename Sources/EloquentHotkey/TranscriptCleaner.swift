@@ -11,8 +11,18 @@ struct CleanupEngineStatus: Sendable, Equatable {
 }
 
 actor TranscriptCleaner {
+    typealias Refinement = @Sendable (String) async throws -> String?
+
     private let fallbackPolisher = TextPolisher()
+    private let validator = TranscriptCleanupValidator()
     private let logger = Logger(subsystem: "dev.codex.EloquentHotkey", category: "Cleanup")
+    private let refine: Refinement
+
+    init(refine: Refinement? = nil) {
+        self.refine = refine ?? { transcript in
+            try await Self.refineWithAppleModel(transcript)
+        }
+    }
 
     static func currentStatus() -> CleanupEngineStatus {
         #if canImport(FoundationModels)
@@ -39,78 +49,38 @@ actor TranscriptCleaner {
         guard !fallback.isEmpty else {
             return fallback
         }
-
-        #if canImport(FoundationModels)
-        if #available(macOS 26.0, *), AppleTranscriptCleanupEngine.isUsable {
-            do {
-                let refined = try await AppleTranscriptCleanupEngine.clean(fallback)
-                let polished = fallbackPolisher.polish(refined)
-                if looksReasonable(polished, comparedTo: fallback) {
-                    logger.debug("Used Apple on-device transcript cleanup")
-                    return polished
-                }
-
-                logger.notice("Discarded Apple cleanup result because it removed or rewrote too much of the fallback transcript")
-            } catch {
-                logger.warning("Apple cleanup failed: \(error.localizedDescription, privacy: .public)")
-            }
+        // Prefer instant local polishing over model punctuation for short commands.
+        // The validator only permits cosmetic changes when there is so little context.
+        guard validator.requiresModelRefinement(for: fallback) else {
+            return fallback
         }
-        #endif
+
+        do {
+            guard let refined = try await refine(fallback) else {
+                logger.debug("Used local cleanup because model refinement was unavailable or would not fit in the context")
+                return fallback
+            }
+            let polished = fallbackPolisher.polish(refined)
+            if validator.accepts(polished, comparedTo: fallback) {
+                logger.debug("Used Apple on-device transcript cleanup")
+                return polished
+            }
+
+            logger.notice("Discarded Apple cleanup result because it removed or rewrote too much of the fallback transcript")
+        } catch {
+            logger.warning("Apple cleanup failed: \(error.localizedDescription, privacy: .public)")
+        }
 
         return fallback
     }
 
-    private func looksReasonable(_ cleaned: String, comparedTo fallback: String) -> Bool {
-        guard !cleaned.isEmpty else {
-            return false
+    private static func refineWithAppleModel(_ transcript: String) async throws -> String? {
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *), AppleTranscriptCleanupEngine.isUsable {
+            return try await AppleTranscriptCleanupEngine.shared.clean(transcript)
         }
-
-        let ratio = Double(cleaned.count) / Double(max(fallback.count, 1))
-        let fallbackWords = Self.normalizedWords(in: fallback)
-        guard fallbackWords.count >= 6 else {
-            return ratio >= 0.4 && ratio <= 1.6
-        }
-
-        guard ratio >= 0.8 && ratio <= 1.25 else {
-            return false
-        }
-
-        let cleanedWords = Self.normalizedWords(in: cleaned)
-        guard cleanedWords.count >= max(fallbackWords.count - 2, 1) else {
-            return false
-        }
-
-        let retention = Self.orderedWordRetention(reference: fallbackWords, candidate: cleanedWords)
-        return retention >= 0.88
-    }
-
-    private static func normalizedWords(in text: String) -> [String] {
-        text.lowercased().split(whereSeparator: { character in
-            !(character.isLetter || character.isNumber || character == "/" || character == "_" || character == "-")
-        }).map(String.init)
-    }
-
-    private static func orderedWordRetention(reference: [String], candidate: [String]) -> Double {
-        guard !reference.isEmpty else {
-            return 1
-        }
-
-        var candidateIndex = 0
-        var matches = 0
-
-        for word in reference {
-            while candidateIndex < candidate.count {
-                if candidate[candidateIndex] == word {
-                    matches += 1
-                    candidateIndex += 1
-                    break
-                }
-
-                candidateIndex += 1
-            }
-        }
-
-        return Double(matches) / Double(reference.count)
+        #endif
+        return nil
     }
 }
 
@@ -122,8 +92,20 @@ private struct TranscriptCleanupResponse {
 }
 
 @available(macOS 26.0, *)
-private enum AppleTranscriptCleanupEngine {
+private actor AppleTranscriptCleanupEngine {
+    static let shared = AppleTranscriptCleanupEngine()
     private static let model = SystemLanguageModel.default
+    private var overheadTokenCounts: (instructions: Int, schema: Int)?
+    private static let instructions = """
+    You clean raw speech-to-text transcripts for a macOS dictation app.
+    Return only the cleaned transcript text.
+    Make minimal edits and preserve the speaker's wording and meaning.
+    Fix punctuation, capitalization, and obvious speech-recognition mistakes.
+    Preserve and correct developer and product names like GitHub, macOS, iOS, iPadOS, watchOS, visionOS, Swift, SwiftUI, Xcode, OpenAI, ChatGPT, JavaScript, TypeScript, GraphQL, PostgreSQL, API, URL, JSON, SQL, and CLI.
+    Remove only obvious filler words or false starts.
+    Do not add commentary, explanations, or markdown.
+    \(CodingLexicon.cleanupGuidance)
+    """
 
     static var isUsable: Bool {
         model.isAvailable && (model.supportsLocale(Locale(identifier: "en_US")) || model.supportsLocale(.current))
@@ -155,41 +137,72 @@ private enum AppleTranscriptCleanupEngine {
         }
     }
 
-    static func clean(_ transcript: String) async throws -> String {
-        let session = LanguageModelSession(model: model) {
-            """
-            You clean raw speech-to-text transcripts for a macOS dictation app.
-            Return only the cleaned transcript text.
-            Make minimal edits and preserve the speaker's wording and meaning.
-            Fix punctuation, capitalization, and obvious speech-recognition mistakes.
-            Preserve and correct developer and product names like GitHub, macOS, iOS, iPadOS, watchOS, visionOS, Swift, SwiftUI, Xcode, OpenAI, ChatGPT, JavaScript, TypeScript, GraphQL, PostgreSQL, API, URL, JSON, SQL, and CLI.
-            Remove only obvious filler words or false starts.
-            Do not add commentary, explanations, or markdown.
-            \(CodingLexicon.cleanupGuidance)
-            """
+    func clean(_ transcript: String) async throws -> String? {
+        let prompt = """
+        Clean this transcript with minimal edits:
+
+        \(transcript)
+        """
+        let overhead = try await tokenCountsForOverhead()
+        let promptTokens: Int
+        if #available(macOS 26.4, *) {
+            promptTokens = try await Self.model.tokenCount(for: Prompt(prompt))
+        } else {
+            promptTokens = CleanupTokenBudget.conservativeTokenCount(for: prompt)
         }
 
+        guard let maximumResponseTokens = CleanupTokenBudget.maximumResponseTokens(
+            promptTokens: promptTokens,
+            instructionTokens: overhead.instructions,
+            schemaTokens: overhead.schema,
+            contextSize: Self.model.contextSize
+        ) else {
+            return nil
+        }
+
+        let session = LanguageModelSession(model: Self.model, instructions: Self.instructions)
         let options = GenerationOptions(
-            sampling: .greedy,
+            samplingMode: .greedy,
             temperature: nil,
-            maximumResponseTokens: recommendedMaximumResponseTokens(for: transcript)
+            maximumResponseTokens: maximumResponseTokens
         )
 
         let response = try await session.respond(
-            to: """
-            Clean this transcript with minimal edits:
-
-            \(transcript)
-            """,
+            to: prompt,
             generating: TranscriptCleanupResponse.self,
             options: options
         )
 
+        if #available(macOS 27.0, *),
+           !CleanupTokenBudget.responseFitsBudget(
+               outputTokens: response.usage.output.totalTokenCount,
+               maximumResponseTokens: maximumResponseTokens
+           ) {
+            return nil
+        }
+
         return response.content.cleanedText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func recommendedMaximumResponseTokens(for transcript: String) -> Int {
-        max(64, min(256, transcript.count / 2))
+    private func tokenCountsForOverhead() async throws -> (instructions: Int, schema: Int) {
+        if let overheadTokenCounts {
+            return overheadTokenCounts
+        }
+
+        let counts: (instructions: Int, schema: Int)
+        if #available(macOS 26.4, *) {
+            let instructions = try await Self.model.tokenCount(for: Instructions(Self.instructions))
+            let schema = try await Self.model.tokenCount(for: TranscriptCleanupResponse.generationSchema)
+            counts = (instructions, schema)
+        } else {
+            let instructions = CleanupTokenBudget.conservativeTokenCount(for: Self.instructions)
+            let schema = try JSONEncoder().encode(TranscriptCleanupResponse.generationSchema).count
+            counts = (instructions, schema)
+        }
+        // Instructions and schema are constant. Only tokenize the new prompt on
+        // subsequent dictations, keeping token accounting off the repeated hot path.
+        overheadTokenCounts = counts
+        return counts
     }
 
     private static var supportedLocaleDescription: String {
